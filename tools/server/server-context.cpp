@@ -858,6 +858,9 @@ private:
             params_base.speculative.mtp.model   = model_mtp.get();
             params_base.speculative.mtp.cparams = cparams_mtp;
 
+            // Share output.weight with trunk model — saves ~1 GB GPU RAM
+            llama_model_link_shared_tensors(model_mtp.get(), model);
+
             if (params_base.n_cache_reuse) {
                 params_base.n_cache_reuse = 0;
                 SRV_WRN("%s\n", "cache_reuse is not supported with MTP, it will be disabled");

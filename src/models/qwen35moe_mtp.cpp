@@ -24,12 +24,10 @@ void llama_model_qwen35moe_mtp::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_qwen35moe_mtp::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
 
-    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), { n_embd, n_vocab }, 0);
+    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd },          TENSOR_NOT_REQUIRED);
-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
-    if (output == nullptr) {
-        output  = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
-    }
+    // Deferred: both tok_embd and output shared from trunk via link_shared_tensors().
+    output      = nullptr;
 
     const int64_t n_ff_exp   = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
     const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
@@ -247,4 +245,20 @@ llama_model_qwen35moe_mtp::graph::graph(const llama_model & model, const llm_gra
 
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
+}
+
+void llama_model_qwen35moe_mtp::link_shared_tensors(const llama_model * main_model) {
+    const ggml_tensor * main_embd = main_model->get_tensor("token_embd.weight");
+    if (!main_embd) {
+        main_embd = main_model->get_tensor("output.weight");
+    }
+    const ggml_tensor * main_output_norm = main_model->get_tensor("output_norm.weight");
+
+    if (main_embd) {
+        tok_embd = const_cast<ggml_tensor *>(main_embd);
+        output   = const_cast<ggml_tensor *>(main_embd);
+    }
+    if (main_output_norm) {
+        output_norm = const_cast<ggml_tensor *>(main_output_norm);
+    }
 }

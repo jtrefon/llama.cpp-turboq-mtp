@@ -21,8 +21,11 @@ void llama_model_qwen35_mtp::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_qwen35_mtp::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
 
-    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), { n_embd, n_vocab }, 0);
+    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd },          TENSOR_NOT_REQUIRED);
+    // Share tok_embd from trunk via link_shared_tensors(). Let output load its own
+    // copy — the output projection needs the quant type the MTP head was calibrated
+    // for (Q6_K), not the trunk's embedding quant (Q4_K).
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
     if (output == nullptr) {
         output  = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
@@ -202,4 +205,29 @@ llama_model_qwen35_mtp::graph::graph(const llama_model & model, const llm_graph_
 
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
+}
+
+void llama_model_qwen35_mtp::link_shared_tensors(const llama_model * main_model) {
+    const ggml_tensor * main_embd = main_model->get_tensor("token_embd.weight");
+    if (!main_embd) {
+        main_embd = main_model->get_tensor("output.weight");
+    }
+    const ggml_tensor * main_output_norm = main_model->get_tensor("output_norm.weight");
+
+    if (main_embd) {
+        LLAMA_LOG_INFO("%s: sharing tok_embd from trunk (%s, ne=[%d %d %d %d]) — saving ~682 MiB\n",
+            __func__, ggml_type_name(main_embd->type),
+            (int)main_embd->ne[0], (int)main_embd->ne[1],
+            (int)main_embd->ne[2], (int)main_embd->ne[3]);
+        tok_embd = const_cast<ggml_tensor *>(main_embd);
+        // Note: output is NOT shared — it needs the quant type the MTP head
+        // expects (Q6_K or whatever was loaded from the GGUF).
+    } else {
+        LLAMA_LOG_WARN("%s: trunk model has no token_embd.weight or output.weight\n", __func__);
+    }
+    if (main_output_norm) {
+        output_norm = const_cast<ggml_tensor *>(main_output_norm);
+    } else {
+        LLAMA_LOG_WARN("%s: trunk model has no output_norm.weight\n", __func__);
+    }
 }
