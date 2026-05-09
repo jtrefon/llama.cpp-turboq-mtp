@@ -711,6 +711,9 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
     }
 }
 
+// Planar3/Iso3 CPU reference dequant/quant — provided by ggml-planar-quant.c and ggml-iso-quant.c
+// (ported from rotorquant fork with Givens/quaternion inverse rotation)
+
 size_t quantize_tbq4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
     (void)imatrix;
     assert(n_per_row % QK_TBQ4 == 0);
