@@ -716,17 +716,17 @@ private:
     void destroy() {
         llama_init.reset();
 
-        ctx = nullptr;
-        model = nullptr;
-
-        mtmd_free(mctx);
-        mctx = nullptr;
-
         for (server_slot & slot : slots) {
             if (slot.can_speculate()) {
                 slot.spec.reset();
             }
         }
+
+        ctx = nullptr;
+        model = nullptr;
+
+        mtmd_free(mctx);
+        mctx = nullptr;
 
         llama_batch_free(batch);
     }
@@ -971,7 +971,7 @@ private:
 
             // try speculative decoding
             if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
-                slot.is_mtp_enabled = params_base.speculative.has_mtp();
+                slot.is_mtp_enabled = params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP;
                 slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx));
 
                 if (slot.spec) {
