@@ -745,10 +745,6 @@ private:
                 return false;
             }
 
-            params_base.speculative.draft.model = model_dft.get();
-            params_base.speculative.draft.cparams = common_context_params_to_llama(params_dft);
-            params_base.speculative.draft.cparams.n_rs_seq = 0;
-
             auto cparams = common_context_params_to_llama(params_dft);
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
 
@@ -756,6 +752,9 @@ private:
 
             params_base.speculative.draft.ctx_tgt = ctx_tgt;
             params_base.speculative.draft.ctx_dft = ctx_dft.get();
+        } else {
+            // MTP (or any other spec type) still needs ctx_tgt set
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
         }
 
         // MTP model loading — QuetzaCodetl fork

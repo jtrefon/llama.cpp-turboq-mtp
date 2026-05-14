@@ -365,7 +365,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
-struct common_speculative_state_mtp : public common_speculative_state {
+struct common_speculative_state_mtp : public common_speculative_impl {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_mtp = nullptr;
 
@@ -379,7 +379,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
     common_speculative_state_mtp(enum common_speculative_type type,
                                  llama_context * ctx_tgt,
                                  llama_context * ctx_mtp)
-        : common_speculative_state(type), ctx_tgt(ctx_tgt), ctx_mtp(ctx_mtp) {
+        : common_speculative_impl(type, /*n_seq=*/ 1), ctx_tgt(ctx_tgt), ctx_mtp(ctx_mtp) {
         GGML_ASSERT(ctx_tgt && ctx_mtp);
         const llama_model * model_mtp = llama_get_model(ctx_mtp);
         n_embd = llama_model_n_embd(model_mtp);
@@ -392,7 +392,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
             smpl = common_sampler_init(model_mtp, sparams);
         }
 
-        // TODO: multiple seq support
+        // MTP: single sequence only
         batch = llama_batch_init(/*n_tokens=*/ 1, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
         batch.token = (llama_token *) malloc(sizeof(llama_token));
         batch.n_tokens     = 1;
@@ -412,7 +412,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
         }
     }
 
-    void begin(const llama_tokens & prompt) override {
+    void begin(llama_seq_id /*seq_id*/, const llama_tokens & prompt) override {
         last_n_accepted = -1;
         last_n_drafted  = 0;
 
@@ -429,16 +429,20 @@ struct common_speculative_state_mtp : public common_speculative_state {
         }
     }
 
-    void draft(
-            const common_params_speculative & params,
-            const llama_tokens & prompt_tgt,
-            llama_token id_last,
-            llama_tokens & draft_tokens) override {
-        GGML_UNUSED(prompt_tgt);
-        draft_tokens.clear();
+    bool process(const llama_batch & /*batch*/) override {
+        // MTP streaming hook handles KV synchronisation automatically
+        return true;
+    }
 
-        // accept with no-accepts (i.e. 0 accepts) returns early, but we still need to remove from the MTP kv-cache
-        // TODO: check if bug in other spec states
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        if (dparams.empty()) return;
+        auto & dp = dparams[0];
+        if (!dp.drafting) return;
+
+        const int32_t n_max     = std::max(1, dp.n_max > 0 ? dp.n_max : 3);
+        const size_t  row_bytes = (size_t) n_embd * sizeof(float);
+
+        // clean up previous draft if not accepted
         if (last_n_drafted > 0) {
             const int32_t n_to_drop = (int32_t) last_n_drafted - 1;
             if (n_to_drop > 0) {
@@ -452,28 +456,22 @@ struct common_speculative_state_mtp : public common_speculative_state {
             last_n_accepted = 0;
         }
 
-        const int32_t n_max     = std::max(1, params.draft.n_max);
-        const size_t  row_bytes = (size_t) n_embd * sizeof(float);
-
-        llama_token cond_tok = id_last;
+        llama_token cond_tok = dp.id_last;
         llama_pos   pos      = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0) + 1;
 
-        // auto-regressive loop for MTP
+        // auto-regressive MTP drafting loop
         for (int32_t k = 0; k < n_max; ++k) {
             ggml_tensor * src;
             int32_t       src_row;
             if (k == 0) {
                 src = llama_context_get_t_h_pre_norm(ctx_tgt);
                 if (last_n_accepted < 0) {
-                    // First draft after begin(): trunk's most recent decode is
-                    // the last prefill ubatch; its last row is h_{N-1}.
                     src_row = (src && src->ne[1] > 0) ? (int32_t) src->ne[1] - 1 : 0;
                 } else {
                     src_row = last_n_accepted;
                 }
                 llama_synchronize(ctx_tgt);
             } else {
-                // for the AR path get the mtp_out from the mtp ctx
                 src = llama_context_get_t_mtp_out(ctx_mtp);
                 src_row = src ? (int32_t) src->ne[1] - 1 : 0;
                 llama_synchronize(ctx_mtp);
@@ -496,15 +494,16 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
             const llama_token best = common_sampler_sample(smpl, ctx_mtp, 0);
             common_sampler_accept(smpl, best, /*accept_grammar=*/ false);
-            draft_tokens.push_back(best);
+            dp.result->push_back(best);
             cond_tok = best;
             ++pos;
         }
 
-        last_n_drafted = (uint16_t) draft_tokens.size();
+        last_n_drafted = (uint16_t) dp.result->size();
+        dp.drafting = false;
     }
 
-    void accept(uint16_t n_accepted) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t n_accepted) override {
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0);
         const int32_t n_drafted_last = (int32_t) last_n_drafted;
         const int32_t n_to_drop = std::max(0, n_drafted_last - (int32_t) n_accepted - 1);
@@ -521,13 +520,6 @@ struct common_speculative_state_mtp : public common_speculative_state {
         last_n_accepted = (int32_t) n_accepted;
     }
 
-    int32_t n_max(const common_params_speculative & params) const override {
-        return std::max(1, params.draft.n_max);
-    }
-
-    int32_t n_min(const common_params_speculative & params) const override {
-        return std::max(1, params.draft.n_min);
-    }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
@@ -1312,7 +1304,12 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
 
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
-    GGML_ASSERT(impl);
+    if (!impl) {
+        // No impl recorded for this sequence yet — can happen on first
+        // request before drafting, or with MTP where begin() was called
+        // but process() hasn't assigned a speculator.
+        return;
+    }
 
     {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
