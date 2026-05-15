@@ -500,7 +500,8 @@ struct common_speculative_state_mtp : public common_speculative_impl {
         }
 
         last_n_drafted = (uint16_t) dp.result->size();
-        dp.drafting = false;
+        // NOTE: do NOT set dp.drafting = false — the upstream
+        // common_speculative_draft() clears it AFTER recording impl_last.
     }
 
     void accept(llama_seq_id /*seq_id*/, uint16_t n_accepted) override {
