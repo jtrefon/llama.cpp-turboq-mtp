@@ -2748,9 +2748,12 @@ private:
                     // - the model does not support partial sequence removal
                     // - the model uses SWA (and we are not using `swa_full`)
                     // - the model supports partial sequence removal but only up to a fixed bound
+                    // - MTP uses recurrent memory with limited n_rs_seq rollback (<10 tokens),
+                    //   making partial seq_rm useless for multi-turn cache reuse
                     do_checkpoint = do_checkpoint && (
                             (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) ||
-                            (n_swa > 0));
+                            (n_swa > 0) ||
+                            slot.is_mtp());
 
                     bool has_mtmd = false;
 
