@@ -578,6 +578,7 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_GATED_DELTA_NET_PIPE,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -2590,6 +2591,26 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // fused chunk pipeline: replaces the sequential loop in build_delta_net_chunking
+    // state:   [S_v, S_v, H_v, n_seqs]      - initial recurrent state
+    // k_cd:    [S_k, CS, n_chunks, H_b*n_s] - cumulative decay keys (H_b = max(H_k, H_v))
+    // v_t:     [CS, S_v, n_chunks, H_v*n_s] - transposed values
+    // kq:      [CS, CS, n_chunks, H_k*n_s]  - intra-chunk attention
+    // q_g_exp: [S_k, CS, n_chunks, H_k*n_s] - queries x exp(gate_cumsum)
+    // kg_t:    [CS, S_k, n_chunks, H_v*n_s] - transposed key x diff(gate) + g_last appended on CS dim
+    // n_tokens, CS, kda packed in op_params
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_pipe(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * k_cd,
+            struct ggml_tensor  * v_t,
+            struct ggml_tensor  * kq,
+            struct ggml_tensor  * q_g_exp,
+            struct ggml_tensor  * kg_t,
+            int                   n_tokens,
+            int                   CS,
+            bool                  kda);
 
     // DSA lightning indexer
     //
