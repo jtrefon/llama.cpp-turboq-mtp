@@ -1,0 +1,9 @@
+GGUF metadata patch record (2026-08-03)
+file: /home/jack/llm/models/gemma-4-12B-it-Q4_K_M.gguf
+field: gemma4.context_length (uint32)
+offset: 887 (value), field starts 854
+original: 00000200 = 131072
+patched to: 00040000 = 262144
+reason: Q8_0 GGUF of same model declares 262144; model card max 262K; converter stamped 131072 by mistake
+revert: write back 00000200 at offset 887
+header sha256 (pre-patch): 8f5b2856f49016da6e0898cfeaa6af2868f75672b4d6cbff0f3fc5bb94c55d0a

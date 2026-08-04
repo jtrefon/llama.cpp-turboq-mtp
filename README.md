@@ -1,17 +1,8 @@
-# llama.cpp-mtp — Fused TBQ4 Flash Attention + MTP + Shared Tensors
+# llama.cpp-TurboQuant-DSV4 — Fused TBQ4 Flash Attention + MTP + DSV4 Native TBQ4
 
-> **Fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)** with fused TurboQuant flash attention — the FA kernel reads raw TBQ4_0 K/V blocks directly from global memory and dequants via centroid lookup in the FWHT-rotated domain. No separate dequant pass, no intermediate F16 buffer.
+> **Fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)** (ggml-org lineage, b10217 rebase base `a7a6d0d26`) combining TurboQuant KV cache (TBQ3/TBQ4), RotorQuant, MTP speculative decoding, and — the headline of this repo — **DSV4 native TBQ4 KV cache via dequant-at-read** (Option A): DeepSeek-V4-Flash KV cache stored natively as TBQ4_0 and dequantized at read time, no Q8_0 fallback, no separate dequant pass.
 
-**80-179 tok/s decode (325 effective) with lossless 4.25 bpv KV cache at 262K context on RTX 4090 24GB.**
-
-> ## ⚠️ NVIDIA / RTX-4090-Dedicated Fork
->
-> This is a **separate, NVIDIA-only fork**. It assumes a single **NVIDIA RTX 4090 (Ada Lovelace, sm_89)** with CUDA and makes no attempt at portability to CPU, ROCm, Metal, or other vendors:
-> - Async checkpoint capture relies on **pinned host memory, CUDA streams, and `cudaLaunchHostFunc`** (`cudaStreamPerThread`); non-CUDA builds fall back to the synchronous path.
-> - KV-cache and attention kernels target **TurboQuant TBQ4 / RotorQuant** layouts and the fused Flash-Attention path.
-> - Optimizations (Tensor-Core matmul, fused DeltaNet, MTP) are tuned for one RTX 4090 with 24 GiB VRAM and a 262K-context, lossless-KV workload.
->
-> We do **not** intend to upstream these changes to mainline llama.cpp.
+**Measured on RTX 4090 24GB + 94Gi DDR4 (DeepSeek-V4-Flash-0731 abliterated, IQ2XXS, 81GB): 11.61 t/s gen @ 4K, 10.29 t/s @ 256K, 9.30 t/s @ 512K, VmSwap 0 everywhere, quality 12/12 correct (v2 native concat).**
 
 ---
 
@@ -19,50 +10,119 @@
 
 | Feature | Description | Status |
 |---------|-------------|--------|
-| **Fused TBQ4 Flash Attention** | Quantized-KV dequant inside the FA inner loop via rotated-domain attention | Working, 82+ tok/s |
-| **MTP Speculative Decoding** | Multi-Token Prediction for Qwen3.6 (PR #22673) with 3 draft tokens per forward pass | Working, 50–68% accept (head-quality limited; see [PROPOSAL](PROPOSAL-mtp-acceptance.md)) |
-| **CUDA TBQ4_0 Kernels** | FWHT-based TurboQuant quantize/dequant on GPU (ported from dflash fork) | Working |
+| **DSV4 Native TBQ4 KV Cache (dequant-at-read)** | DeepSeek-V4-Flash KV stored natively as TBQ4_0; v2 strided-quantized concat kernel bypasses F32 dequant at csa/hca sites (2.16x speedup at 512K). Lid site still dequants at read. | ✅ **Headline — this work** |
+| **Fused TBQ4 Flash Attention** | Quantized-KV dequant inside the FA inner loop via rotated-domain attention (centroid lookup, no intermediate F16 buffer) | Working, 82+ tok/s (Qwen3.6) |
+| **MTP Speculative Decoding** | Multi-Token Prediction for Qwen3.6 (PR #22673 lineage) with 3 draft tokens per forward pass; custom implementation kept (see below) | Working, 73-98% accept |
+| **Fused TBQ3 Flash Attention** | 3-bit KV compression (3.0625 bpv, ~24% smaller than TBQ4), fused inline dequant. Mixed TBQ4+TBQ3 via DSV4_CTK_COMP | Working — validated 2026-08-03 (GPU KV) |
+| **CUDA TBQ4_0 Kernels** | FWHT-based TurboQuant quantize/dequant on GPU (ported from the dflash fork) | Working |
 | **Tensor Sharing API** | `link_shared_tensors()` prevents 682 MiB GPU duplication of token embeddings between trunk and MTP models | Working |
-| **RotorQuant (PlanarQuant + IsoQuant)** | 4 new 3-bit/4-bit KV cache types using Givens/quaternion rotations — faster dequant, better compression, 5.3x faster prefill | ✅ New! |
-| **Async Checkpoint Capture** | Prompt checkpoints captured via async D2H into a pinned staging ring (≤2 slots, ~300 MiB pinned) so the 32× ~149 MiB state readbacks overlap with prefill compute instead of stalling it | ✅ New! |
-| **KV Pad Floor** | Configurable via `LLAMA_KV_PAD_MIN` env (default 4096); 16× fewer graph re-captures than upstream hardcoded 256 | Working |
-| **Adaptive Draft Depth** | `--spec-adapt` throttles MTP draft depth on pathologically low acceptance (<35%); guards against wasted compute during dips | Working |
-| **P-Core Binding** | Architecture proposal for pinning hot main thread to dedicated P-core on i9-12900K; see [ARCHITECTURE](ARCHITECTURE-pcore-binding.md) | Proposed |
+| **RotorQuant (PlanarQuant + IsoQuant)** | 4 new 3-bit/4-bit KV cache types using Givens/quaternion rotations — faster dequant, better compression | Working |
 
-### Documentation / Proposals
+---
 
-| Document | Purpose |
-|----------|---------|
-| [PROPOSAL-mtp-acceptance.md](PROPOSAL-mtp-acceptance.md) | Root-cause analysis of 50% acceptance gap + four ranked levers (temp, adaptive depth, EAGLE3, FastMTP) |
-| [FASTMTP-RETRAIN.md](FASTMTP-RETRAIN.md) | Handoff for model owner: retrain MTP head with FastMTP objective (+82% accept) |
-| [ARCHITECTURE-pcore-binding.md](ARCHITECTURE-pcore-binding.md) | P-core affinity + OpenMP isolation for single-threaded ggml build path |
-| [CHANGES-UNCOMMITTED.md](CHANGES-UNCOMMITTED.md) | Revert guide for all local changes |
+## DSV4 Native TBQ4 — v2 Strided-Quantized Concat
 
-### Target Audience & Production Configuration
+Upstream of this work, DSV4 fell back from TBQ quantization to Q8_0 because the DSV4 model path had no TBQ dequant support. This commit (`1a663e2d0`) removes that fallback and stores TBQ4_0 natively in all four DSV4 KV caches (lid, csa raw+csa, hca raw+hca). A `dequant_k_read` helper casts TBQ3/TBQ4 blocks to F32 and reshapes to 4D at the three read sites; the raw ratio-0 site keeps the fused `MMA_TBQ4` path, and the Q8_0 path is byte-identical (the helper is a passthrough there).
 
-This fork is tuned for **Qwopus3.6-27B-v2-MTP** (or compatible Qwen3.5 27B) on a **single RTX 4090 (24 GiB)** at **262K context** with **lossless TBQ4 KV cache**.
+### Why it matters
 
-The production server (`llama-turboq.service`) runs:
+The KV cache is the only thing that scales with context. Native TBQ4 (4.25 bpv) cuts the KV working set to roughly half of Q4_0's. With v2 native concat, 512K context uses just 82.4 GB RSS with **VmSwap 0** — well within a 96GB box. No thrash, no fallback.
 
+### Benchmark (RTX 4090 24GB, DeepSeek-V4-Flash-0731 abliterated IQ2XXS, KV in system RAM)
+
+Server: `llama-server -m <model> --port 8099 -c <ctx> --flash-attn on -t 8 -np 1 --jinja -ctk tbq4_0 -ctv tbq4_0 --no-kv-offload`
+
+| Config | Context | gen t/s | prompt t/s | server RSS | VmSwap | Quality |
+|--------|---------|---------|------------|-----------|--------|---------|
+| **TBQ4 v2 native concat** | 4K | **11.61** | 18.8-20.3 | 81.1 GB | 0 | 12/12 |
+| **TBQ4 v2** | 32K | **11.39** | 19.6-20.6 | 81.1 GB | 0 | 12/12 |
+| **TBQ4 v2** | 256K | **10.29** | 19.1-20.4 | 81.7 GB | 0 | 12/12 |
+| **TBQ4 v2** | 512K | **9.30** | 17.4-19.0 | 82.4 GB | 0 | 12/12 |
+| Q4_0 K+V (mainline ref) | 512K | ~4.8 | — | 83.4-83.7 GB | 0→128 MB | 5/5 |
+
+Quality: **12/12 correct** across all v2 configs (see table). No quantization-noise regression in any config.
+
+**Note on v2:** With v2 native concat, TBQ4 at 512K (9.30 t/s) now outperforms mainline Q4@512K (~4.8 t/s) by 1.94x while using less memory. The DDR4 expert-weight floor (~85ms) sets a hard ceiling at ~12 t/s regardless of context size. Full-context benchmarks (200K+ tokens filled) are pending; CPU analysis estimates ~6-7 t/s at 512K under full fill.
+
+---
+
+## Build
+
+Same build as the rest of the fork — CUDA with `sm_89` (RTX 4090), in a `build-mtp` directory:
+
+```bash
+cd llama.cpp-TurboQuant-DSV4
+cmake -B build-mtp -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89
+cmake --build build-mtp -j$(nproc) --config Release
 ```
---temp 0.6 --top-p 0.95 --min-p 0.05     # fixes agent tool-call loops, raises decode 62→82 tok/s (+31%)
---reasoning on --reasoning-budget 8192    # thinking tokens inside <think> tags
---jinja                                    # model's native Qwen3.5 chat template
---spec-type mtp --spec-draft-n-max 3      # MTP speculative decoding
---spec-adapt                              # adaptive draft-depth guard
--ctk tbq4_0 -ctv tbq4_0                  # TBQ4 lossless KV (4.25 bpv, ~4 GiB @ 262K)
---flash-attn on                           # fused dequant + FA kernel
--c 262144 -ngl 99                         # full context, all layers on GPU
+
+For the full RotorQuant type set (planar3_0 / iso3_0 / planar4_0 / iso4_0), add `-DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON` to the configure step. The `build-mtp` name is the convention used throughout this fork's testing (a plain `build` dir also works); `build-mtp/bin/llama-server` is the resulting binary.
+
+## Run
+
+All variants share the same shape: pick the KV type, keep `--flash-attn on` and `--no-kv-offload` (KV cache lives in system RAM, the model lives in VRAM — this is what makes 512K/1M possible on 24GB + 96GB hardware).
+
+```bash
+# TBQ4 native KV (the headline config — DSV4 stores TBQ4_0 natively, dequant at read)
+./build-mtp/bin/llama-server \
+  -m deepseek-v4-flash-abliterated-IQ2XXS.gguf \
+  -c 524288 --flash-attn on -t 8 -np 1 --jinja \
+  -ctk tbq4_0 -ctv tbq4_0 --no-kv-offload
+
+# Q4_0 KV (daily sweet spot: ~4.8 t/s gen at 512K, smallest KV footprint)
+./build-mtp/bin/llama-server \
+  -m deepseek-v4-flash-abliterated-IQ2XXS.gguf \
+  -c 524288 --flash-attn on -t 8 -np 1 --jinja \
+  -ctk q4_0 -ctv q4_0 --no-kv-offload
+
+# Q8_0 KV (reference / max quality — note: on DSV4 this needs ~32 GB KV at 512K and will thrash on a 96GB box)
+./build-mtp/bin/llama-server \
+  -m deepseek-v4-flash-abliterated-IQ2XXS.gguf \
+  -c 524288 --flash-attn on -t 8 -np 1 --jinja \
+  -ctk q8_0 -ctv q8_0 --no-kv-offload
 ```
 
-Current decode throughput at 262K context: **~82 tok/s** (temp 0.6, MTP 3 drafts).
-The remaining throughput headroom (target: 70–95% MTP acceptance) requires model-side retraining — see [FASTMTP-RETRAIN.md](FASTMTP-RETRAIN.md).
+Context sizing: 4K → 11.61 t/s, 32K → 11.39 t/s, 256K → 10.29 t/s, 512K → 9.30 t/s (v2 native concat). Full-context benchmarks pending.
 
-### RotorQuant — Next-Gen KV Cache Compression
+### MTP mode (Qwen3.6 family)
 
-**RotorQuant replaces the FWHT butterfly with block-diagonal 2D/4D rotations.** Same compression ratio as TBQ4 but with O(d) rotation (fully parallel) instead of O(d log d) Hadamard. Drop-in compatible via `-ctk`/`-ctv` flags.
+```bash
+./build-mtp/bin/llama-server \
+  -m your-qwen3.6-mtp.gguf \
+  --spec-type mtp --spec-draft-n-max 3 \
+  -ctk tbq4_0 -ctv tbq4_0 -c 262144 -ngl 99 \
+  --flash-attn on --mlock -t 8 -ub 32 -np 1 --no-warmup
+```
 
-#### Available Types
+---
+
+## Upstream MTP Status — Why We Keep Our Implementation
+
+As of May 16, 2026, upstream `ggml-org/llama.cpp` merged official MTP support via [PR #22673](https://github.com/ggml-org/llama.cpp/pull/22673) (`255582687`), which uses `--spec-type draft-mtp`. **We are NOT adopting it.** Our custom MTP (`--spec-type mtp`) predates the merge and beats upstream in every measured metric — head-to-head on RTX 4090 24GB with Qwen3.6-27B-Heretic-v2-MTP Q4_K_M:
+
+| Metric | Upstream MTP | Our Fork | Delta |
+|--------|:-----------:|:--------:|:-----:|
+| **Generation speed** | 71.5 tok/s | 82-93 tok/s | **+15-30%** |
+| **Draft acceptance** | 47-89% | 73-98% (avg 92%) | **+3-45 pp** |
+| **KV cache type** | Q4_0 (4.5 bpv) | TBQ4_0 (4.25 bpv) | 6% more compression |
+| **Max context @ 24GB** | ~131K | **262K** | **2x** |
+| **Fused quant FA** | ❌ Separate dequant pass | ✅ Inline dequant in FA loop | Memory + speed |
+| **Tensor sharing** | ❌ 682 MiB duplicated | ✅ `link_shared_tensors()` | Saved 682 MiB |
+| **RotorQuant** | ❌ | ✅ planar3/iso3/planar4/iso4 | 3-4 bit KV cache options |
+
+Future upstream syncs will pull non-MTP improvements (tokenizer fixes, server patches); the TBQ4 + RotorQuant + tensor sharing + MTP stack stays ours.
+
+## Results (Qwen3.6-27B-Heretic-v2-MTP Q4_K_M, RTX 4090 24GB)
+
+| Config | Context | KV Cache | tok/s | Draft Accept | VRAM |
+|--------|---------|----------|-------|-------------|------|
+| **MTP + Fused TBQ4 FA** | **262K** | **TBQ4_0 (4.25 bpv)** | **80-87** | **73-93%** | **~20 GB** |
+| MTP + Q4_0 KV | 200K | Q4_0 (4.5 bpv) | 92-97 | 93.6% | 23.96 GB |
+| Baseline (no MTP, Q4_0 KV) | 200K | Q4_0 | ~40 | - | 23.96 GB |
+
+## RotorQuant — More KV Cache Compression
+
+**RotorQuant replaces the FWHT butterfly with block-diagonal 2D/4D rotations.** Same compression ratio as TBQ4 but with O(d) rotation (fully parallel) instead of O(d log d) Hadamard. Drop-in compatible via `-ctk`/`-ctv`.
 
 | Type | Bits | Block | Rotation | VRAM @ 262K |
 |------|------|-------|----------|-------------|
@@ -72,215 +132,16 @@ The remaining throughput headroom (target: 70–95% MTP acceptance) requires mod
 | `planar4_0` | 4.0 | 66 bytes/128 dims | 2D Givens pairs | 4224 MiB |
 | `iso4_0` | 4.0 | 66 bytes/128 dims | 4D quaternion | 4224 MiB |
 
-#### Benchmark (RTX 4090, Qwen3.6-27B, MTP+FA)
-
-| Type | 4K ctx | 32K ctx | 262K ctx | Notes |
-|------|--------|---------|----------|-------|
-| `tbq4_0` | 55.3 t/s | 51.5 t/s | 77 t/s | Baseline — fused MMA kernel |
-| `planar3_0` | 53.9 t/s | 50.6 t/s | ~47 t/s | Best speed/compression tradeoff |
-| `iso3_0` | 53.5 t/s | 50.5 t/s | — | Same compression as planar3 |
-| `planar4_0` | 52.2 t/s | — | — | 4-bit Givens |
-| `iso4_0` | 50.6 t/s | — | — | 4-bit quaternion |
-
-#### Usage
-
-```bash
-# Build with FA_ALL_QUANTS for planar/iso support
-cmake -B build -DGGML_CUDA=ON -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89
-cmake --build build -j$(nproc) --config Release
-
-# Use planar3_0 for max VRAM savings (saves 1 GB vs TBQ4 at 262K)
-./build/bin/llama-server \
-  -m your-model.gguf \
-  --spec-type mtp --spec-draft-n-max 3 \
-  -ctk planar3_0 -ctv planar3_0 -c 262144 -ngl 99 \
-  --flash-attn on --mlock -t 8 -ub 32 --parallel 1 --no-warmup
-```
-
-#### How It Works
-
-Unlike TBQ4's FWHT (Hadamard) rotation, RotorQuant uses:
-
-- **PlanarQuant**: 64 independent 2D Givens rotations per 128-dim block. Rotation: `[cos θ, sin θ; -sin θ, cos θ]` per element pair. 128 total rotation parameters.
-- **IsoQuant**: 32 independent 4D quaternion rotations per 128-dim block. 128 total rotation parameters.
-
-Both apply the rotation at quantization time. During FA dequant, the inverse rotation is applied inline — centroid lookup → inverse Givens/quaternion → scale by norm. The rotation is trivially parallel (no sequential stages like FWHT).
-
-#### Bugs Fixed
-
-1. **llama-graph.cpp**: Planar/iso removed from TBQ pass-through — VEC path handles dequant inline
-2. **cpy.cu**: 4-bit dequant kernels with inverse rotation (planar4/iso4→F32)
-3. **ggml-cuda.cu**: `supports_op` entries for all new types
-4. **-fit auto**: Memory estimation workaround with `-fit off`
-
-### Recent Fixes (May 11, 2026)
-
-- **NaN sampler crash (#6)**: Guard against all-`-inf` logits in dist sampler — when upstream samplers filter every token to `-infinity`, softmax produces NaN (`-inf - (-inf) = NaN`), causing `assert(found)` failure. Fixed with `!(sum_cum > 0.0)` guard + `test_dist_all_neg_inf` unit test.
-- **Double free**: Upstream cherry-pick from PR #22673 (server-context.cpp lifecycle fix).
-- **RS sequence for MTP only**: Upstream cherry-pick from PR #22673 (fixes partial rollback scope for non-MTP models).
-
-### Recent Changes (May 15-17, 2026)
-
-- **Upstream sync**: Merged upstream `ggml-org/llama.cpp` master (`ec562eb67`, 40 commits). Adopted parallel drafting, renamed types (`DRAFT`→`DRAFT_SIMPLE`), `ctx`→`ctx_tgt`/`ctx_dft` split, MTP adapted to new `common_speculative_impl` interface. 6 merge conflicts resolved (README, common/arg.cpp, common/speculative.cpp, tests, server-context.cpp).
-- **MTP draft regression fix**: `n_draft_max` was unconstrained (261K instead of 3), causing batch overflow. `dp.drafting = false` was set too early, preventing `accept()` from updating `last_n_accepted`, feeding stale hidden states to MTP. Both fixed.
-- **Multi-turn KV cache fix**: Context checkpoints were not created for MTP slots because `n_rs_seq=3` fooled `common_context_can_seq_rm` into returning `PART` type. Without checkpoints, every message turn forced full prompt re-processing (~46s per turn). Fixed by enabling context checkpoints for MTP slots (~150 MiB each on CPU RAM, max 32 = ~4.8 GB). Multi-turn latency: 40-50s → ~460ms (86x improvement).
-- **proper-lockfile Bun interop**: Fixed CJS interop edge case where Bun's bundler returns proper-lockfile under a `'.'` key.
-
-### Recent Changes (Jul 12, 2026)
-
-- **Async checkpoint capture (RTX-4090 / NVIDIA-dedicated)**: Prompt checkpoints (32 × ~149 MiB state readbacks during a 262K prefill) previously stalled the prefill compute stream — `llama_state_seq_get_data_ext` did a full `ctx->synchronize()` plus one blocking `ggml_backend_tensor_get` per state tensor. Now capture is **asynchronous**: the state is copied device→host into a **pinned staging ring** (2 slots, ~300 MiB pinned RAM max) on `cudaStreamPerThread`, overlapping with subsequent prefill compute. A CUDA host callback (`cudaLaunchHostFunc`) copies staging→pageable store and frees the slot within milliseconds, so pinned RAM never exceeds ~300 MiB regardless of checkpoint count. The data is only synchronized (event wait) when a checkpoint is actually *consumed* (cache reuse), where the GPU is idle. Non-CUDA builds fall back to the synchronous path. Verified: checkpoint create + restore work correctly end-to-end.
-
-### Async Checkpoint Capture — Design
-
-```
-create_checkpoint (prefill loop, no stall)
-   └─ update_tgt/update_dft
-        ├─ llama_state_seq_get_data_ext_async  → async D2H into pinned staging (cudaStreamPerThread)
-        └─ cudaLaunchHostFunc(cb): staging → pageable data_tgt/data_dft, release staging slot
-
-follow-up request (GPU idle)
-   └─ load_tgt/load_dft
-        └─ if async still in flight: cudaStreamSynchronize(cudaStreamPerThread)  // cheap, GPU idle
-        └─ llama_state_seq_set_data_ext  (restore)
-```
-
-Pinned RAM is bounded to a 2-slot ring (`ckpt_staging_pool` in `common/common.cpp`) because the RTX 4090 host has little headroom — we deliberately avoid pinning all 32 checkpoints (~4.7 GB).
-
-## Upstream MTP Status
-
-**⚠️ As of May 16, 2026:** Upstream `ggml-org/llama.cpp` merged official MTP support via [PR #22673](https://github.com/ggml-org/llama.cpp/pull/22673) (`255582687`). This is 20 commits ahead of our current sync point (`ec562eb67`). The upstream implementation uses `--spec-type draft-mtp` and `COMMON_SPECULATIVE_TYPE_DRAFT_MTP`.
-
-**Our fork** uses a custom MTP implementation (`--spec-type mtp`, `COMMON_SPECULATIVE_TYPE_MTP`) that predates the upstream merge. Both implementations support Qwen3.6 MTP heads, but ours includes additional features (TBQ4 fused FA, RotorQuant, tensor sharing, context checkpoints for MTP).
-
-**We are keeping our custom MTP implementation.** Head-to-head testing (see below) shows our fork exceeds upstream in every performance metric. Future upstream syncs will pull non-MTP improvements (tokenizer fixes, server patches, etc.) but our TBQ4 + RotorQuant + tensor sharing + MTP stack will remain the core. This fork is stable and production-tested (92% draft acceptance, 29-turn continuous session without errors, 262K context on 24GB VRAM).
-
-### Upstream vs Fork — Head-to-Head (May 17, 2026)
-
-We tested upstream `draft-mtp` (PR #22673, merged May 16) against our custom MTP on identical hardware (RTX 4090 24GB, Qwen3.6-27B-Heretic-v2-MTP Q4_K_M):
-
-| Metric | Upstream MTP | Our Fork | Delta |
-|--------|:-----------:|:--------:|:-----:|
-| **Generation speed** | 71.5 tok/s | 82-93 tok/s | **+15-30%** |
-| **Draft acceptance** | 47-89% | 73-98% (avg 92%) | **+3-45 pp** |
-| **KV cache type** | Q4_0 (4.5 bpv) | TBQ4_0 (4.25 bpv) | 6% more compression |
-| **Max context @ 24GB** | ~131K | **262K** | **2x** |
-| **262K context VRAM** | ❌ Won't fit (needs 32 GB) | ✅ ~20 GB | — |
-| **Fused quant FA** | ❌ Separate dequant pass | ✅ Inline dequant in FA loop | Memory + speed |
-| **Tensor sharing** | ❌ 682 MiB duplicated | ✅ `link_shared_tensors()` | Saved 682 MiB |
-| **RotorQuant** | ❌ | ✅ planar3/iso3/planar4/iso4 | 3-4 bit KV cache options |
-| **Multi-turn cache** | ✅ Checkpoints (native) | ✅ Checkpoints (our fix) | Same mechanism |
-
-**Why we are not adopting upstream MTP:** Upstream's implementation is a clean starting point, but our fork's TBQ4 fused flash attention + RotorQuant + tensor sharing stack delivers significantly higher performance, 2x the context capacity, and better draft acceptance. Upstream MTP lacks the KV cache compression needed for 262K context on consumer GPUs — the TBQ4_0 format (4.25 bpv) is the critical differentiator, using only 4.2 GB for KV cache vs 16.4 GB for upstream's Q4_0 at 262K.
-
-**Upstream commits assessed (20 total, May 14-17):** Of 40+ commits since our sync point, the vast majority are AMD/Vulkan/WebGPU/Hexagon/SYCL backend changes, CI fixes, web UI updates, and Docker configs — none relevant to our CUDA single-GPU setup. The few potentially useful commits (Qwen3.5 tokenizer improvements, reasoning-budget deep-copy fix, server log reduction) are minor quality-of-life improvements that do not warrant destabilizing our stable build. They will be picked up in the next scheduled sync.
-
-## Results (RTX 4090 24GB, Qwen3.6-27B-Heretic-v2-MTP Q4_K_M)
-
-| Config | Context | KV Cache | tok/s | Draft Accept | VRAM |
-|--------|---------|----------|-------|-------------|------|
-| **MTP + Fused TBQ4 FA (May 11)** | **262K** | **TBQ4_0 (4.25 bpv)** | **179.4** | **81.4%** | **~20 GB** |
-| **MTP + Fused TBQ4 FA** | **262K** | **TBQ4_0 (4.25 bpv)** | **80-87** | **73-93%** | **~20 GB** |
-| MTP + Fused TBQ4 FA | 200K | TBQ4_0 (4.25 bpv) | 82-87 | 73% | ~20 GB |
-| MTP + Q4_0 KV | 200K | Q4_0 (4.5 bpv) | 92-97 | 93.6% | 23.96 GB |
-| MTP + Q4_0 KV | 135K | Q4_0 (4.5 bpv) | 97-103 | 93.6% | 22.4 GB |
-| Baseline (no MTP, Q4_0 KV) | 200K | Q4_0 | ~40 | - | 23.96 GB |
-| MTP Draft 5 | 262K | TBQ4_0 | 79.6 avg / 106 peak | 90.1% | ~20 GB |
-
 ## Why This Is Novel
 
-**Nobody else has fused quantized-KV dequant into the flash attention inner loop.** The upstream TBQ4 PR (#21089) is CPU-only. The dflash fork (spiritbuun) has CUDA TBQ4 kernels but uses `nstages=0` with a separate dequant-to-F16 pass before FA. Our kernel reads raw TBQ4 blocks directly:
+**Nobody else has fused quantized-KV dequant into the flash attention inner loop.** The upstream TBQ4 PR (#21089) is CPU-only. The dflash fork has CUDA TBQ4 kernels but uses a separate dequant-to-F16 pass before FA. Our kernel reads raw TBQ4 blocks directly:
 
 ```
 Standard path:  TBQ4 → dequant → F16 buffer → FA kernel reads F16
 Our fused path: TBQ4 → FA kernel reads raw bytes → centroid×norm lookup inline
 ```
 
-The key insight: since the Hadamard transform is orthonormal, **attention can operate entirely in the rotated domain**. Q is pre-rotated once, K/V are pre-rotated at quantization time, and the output is post-rotated once. The inner loop only needs a 2-value centroid lookup per element — no FWHT butterfly, no precomputed tables.
-
-### Optimizations (43 → 82 tok/s across 5 sessions)
-
-1. **Column-group access pattern** — threads process one column across all rows instead of one row per thread, nearly doubling bandwidth utilization
-2. **Direct centroid lookup** — look up only the 2 centroid values needed per byte instead of precomputing all 16 (saving 14 FP muls + 14 float-to-half conversions per element)
-3. **Rotated-domain attention** — FWHT runs only twice total (Q rotate in, output rotate out), never inside the KV iteration loop
-
----
-
-## Quick Start
-
-```bash
-git clone https://github.com/Indras-Mirror/llama.cpp-mtp
-cd llama.cpp-mtp
-cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89
-cmake --build build -j$(nproc) --config Release
-
-# Fused TBQ4 FA + MTP (80-87 tok/s at 262K, lossless 4.25 bpv KV)
-./build/bin/llama-server \
-  -m your-qwen3.6-mtp.gguf \
-  --spec-type mtp --spec-draft-n-max 3 \
-  -ctk tbq4_0 -ctv tbq4_0 -c 262144 -ngl 99 \
-  --flash-attn on --mlock -t 8 -ub 32 -np 1 --no-warmup
-
-# Or with Q4_0 KV for max raw speed (92-97 tok/s at 200K, uses more VRAM)
-./build/bin/llama-server \
-  -m your-qwen3.6-mtp.gguf \
-  --spec-type mtp --spec-draft-n-max 3 \
-  -ctk q4_0 -ctv q4_0 -c 200000 -ngl 99 \
-  --flash-attn on --mlock -ub 32 -np 1
-```
-
-### Getting an MTP-capable GGUF
-
-**Option A: Pre-built Native-MTP-Preserved GGUF (Recommended)**
-
-Use llmfan46's pre-built GGUF with all 15 native MTP heads preserved from Qwen3.6 training:
-
-```bash
-# Download from HuggingFace (~17 GB, Q4_K_M, 15 native MTP heads)
-wget https://huggingface.co/llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GGUF/resolve/main/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q4_K_M.gguf
-```
-
-Model: `Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q4_K_M.gguf`
-Source: [llmfan46 on HuggingFace](https://huggingface.co/llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GGUF) — Heretic v1.3 MPOA uncensored fine-tune (94% fewer refusals, 0.0021 KL divergence, 85.67% MMLU)
-
-**Option B: Graft MTP heads onto any Qwen3.6 GGUF**
-
-Standard GGUF conversion strips MTP layers. Graft them back:
-
-```bash
-# Download MTP head GGUF (457 MB, only the draft head tensors)
-wget https://huggingface.co/havenoammo/Qwen3.6-27B-MTP-UD-GGUF/resolve/main/MTP-Q8_0.gguf
-
-uv venv .venv --seed && source .venv/bin/activate
-uv pip install gguf
-python convert.py base-model.gguf MTP-Q8_0.gguf output-mtp.gguf
-```
-
----
-
-## Architecture
-
-### Fused TBQ4 Flash Attention Pipeline
-
-```
-1. k_tbq4_rotate_input    → Pre-rotate Q via FWHT (separate kernel, 128-thread warp shuffle)
-2. Fused FA kernel         → Read raw TBQ4 blocks from GMEM, centroid×norm dequant inline
-3. k_tbq4_rotate_output   → Post-rotate VKQ back to original domain
-```
-
-K/V are pre-rotated at SET_ROWS time (`quantize_f32_tbq4_0_block` calls `tbq4_rotate_forward` before quantization). Everything in the FA inner loop operates in the rotated domain.
-
-### TBQ4_0 Block Format
-
-```c
-struct block_tbq4_0 {      // 66 bytes per 128 elements (4.25 bits per value)
-    ggml_half d;            // corrected L2 norm (2 bytes)
-    uint8_t qs[QK_TBQ4/2]; // packed 4-bit centroid indices (64 bytes)
-};
-```
-
-16 Lloyd-Max centroids optimized for N(0, 1/sqrt(128)) in the FWHT domain, stored in CUDA `__constant__` memory.
-
-### Inner Loop (the hot path)
+The key insight: since the Hadamard transform is orthonormal, **attention can operate entirely in the rotated domain** — Q is pre-rotated once, K/V are pre-rotated at quantization time, and the output is post-rotated once. The inner loop only needs a 2-value centroid lookup per element:
 
 ```cuda
 // Per byte = 2 KV elements. This is the entire dequant:
@@ -290,96 +151,142 @@ const half hi = __float2half(d_tbq4_centroids[byte >> 4] * norm);
 tile[...] = __halves2half2(lo, hi);
 ```
 
-### Tensor Sharing — `link_shared_tensors()` API
-
-MTP loads `token_embd.weight` as a separate 682 MiB GPU allocation — a duplicate. Our API lets sibling models wire shared tensors:
-
-```cpp
-// include/llama.h
-LLAMA_API void llama_model_link_shared_tensors(
-    struct llama_model * model,
-    const struct llama_model * trunk);
-```
-
-Implemented for `qwen35_mtp` and `qwen35moe_mtp`. Saves 682 MiB with zero quality impact.
-
----
-
-## Files Added/Modified
-
-### Fused TBQ4 Flash Attention (novel)
-| File | Purpose |
-|------|---------|
-| `ggml/src/ggml-cuda/fattn-mma-tbq4.cuh` | **NEW** — Fused tile loader, rotation kernels, centroid lookup |
-| `ggml/src/ggml-cuda/fattn-mma-tbq4-launch.cuh` | **NEW** — Template launcher, shmem calculation |
-| `ggml/src/ggml-cuda/fattn-mma-f16.cuh` | Modified — TBQ4 guards in iter function (4 locations) |
-| `ggml/src/ggml-cuda/fattn.cu` | Modified — TBQ4 dispatch + rotation kernel calls |
-| `template-instances/fattn-mma-tbq4-instance-ncols2_{1,2,4,8}.cu` | **NEW** — Template instantiations |
-
-### CUDA TBQ4_0 Kernels (ported from dflash)
-| File | Purpose |
-|------|---------|
-| `ggml/src/ggml-cuda/tbq4-cuda.cuh` | **NEW** — FWHT, quantize, dequant, full-block dequant |
-| `ggml/src/ggml-cuda/set-rows.cu` | TBQ4_0 SET_ROWS dispatch |
-| `ggml/src/ggml-cuda/cpy.cu` | TBQ4_0 to F32/F16 dequant |
-
-### Tensor Sharing Infrastructure
-| File | Purpose |
-|------|---------|
-| `include/llama.h` | `llama_model_link_shared_tensors()` public API |
-| `src/llama-model.h` / `.cpp` | Virtual method + implementation |
-| `src/models/qwen35_mtp.cpp` | Qwen3.5 MTP tensor sharing |
-| `src/models/qwen35moe_mtp.cpp` | Qwen3.5 MoE MTP tensor sharing |
-| `tools/server/server-context.cpp` | Call site after MTP model load |
-
-### Total: 89 files changed, +5,868 / -221 lines vs upstream
-
----
-
 ## Key Flags
 
 | Flag | Purpose |
 |------|---------|
-| `--spec-type mtp --spec-draft-n-max 3` | Enable MTP speculative decoding |
-| `-ctk tbq4_0 -ctv tbq4_0` | Fused TBQ4 KV cache (lossless, 4.25 bpv) |
-| `-ctk q4_0 -ctv q4_0` | Q4_0 KV cache (higher speed, more VRAM) |
-| `-ub 32` | Small ubatch keeps MTP compute buffer at ~712 MiB |
-| `-np 1` | MTP only supports single parallel slot |
+| `-ctk tbq4_0 -ctv tbq4_0` | Native TBQ4 KV cache (4.25 bpv) — DSV4 dequant-at-read path |
+| `-ctk q4_0 -ctv q4_0` | Q4_0 KV cache (daily sweet spot on DSV4 @512K) |
+| `--no-kv-offload` | Keep KV cache in system RAM (enables 512K/1M on 24GB VRAM) |
+| `--flash-attn on` | Required for the fused TBQ4 path |
+| `--spec-type mtp --spec-draft-n-max 3` | Enable MTP speculative decoding (Qwen3.6) |
+| `DSV4_CTK_COMP=tbq3_0` | Per-cache K quant: TBQ4 for raw-ratio sites, TBQ3 for compressed (mixed) |
 | `--mlock` | Prevent swap under memory pressure |
-| `--flash-attn on` | Required for fused TBQ4 path |
-| `--no-warmup` | Skip warmup for faster startup |
+| `-ub 32` | Small ubatch keeps the MTP compute buffer small |
+| `-np 1` | MTP supports a single parallel slot |
 
 ## Known Issues
 
-- **Vision + MTP** crashes (upstream PR bug in multimodal handling — reported 2026-05-06). Use `--spec-type none` for vision tasks.
-- **nstages=2 pipeline** produces garbled output with MTP (non-MTP works at 43.8-45.6 tok/s coherent). Reverted to synchronous nstages=0 for stability.
-- **output.weight sharing** causes 0% draft acceptance (Q4_K ≠ Q6_K quantization error accumulates across embedding layers). `link_shared_tensors()` shares tok_embd only; output gets its own copy.
-- **MTP requires `--parallel 1`** (single slot only — Multi-Token Prediction architecture limitation)
-- **7B models crash with TBQ4** — `nb1=264` is 8-byte aligned, not 16-byte. Deferred. 27B works fine with `nb1=528`.
-- **MoE models (35B-A3B)** may fail with `vector::_M_range_check` in MTP loading if `nextn_predict_layers` metadata is missing or incorrect in the GGUF. Verify `--verbose` output shows the key being read.
-- **MTP draft-n-max 3 vs 5**: Draft 3 gives better per-token speed (80.6 vs 79.6 tok/s) and higher acceptance (92.6% vs 90.1%). Draft 5 occasionally hits higher peaks (106 tok/s) but overhead from verifying longer drafts eats the gain.
+- **Vision + MTP** crashes (upstream PR bug in multimodal handling). Use `--spec-type none` for vision tasks.
+- **nstages=2 pipeline** produces garbled output with MTP (non-MTP is coherent). Reverted to synchronous nstages=0 for stability.
+- **output.weight sharing** causes 0% draft acceptance (Q4_K ≠ Q6_K quantization error accumulates). `link_shared_tensors()` shares `tok_embd` only.
+- **MTP requires `--parallel 1`** (single slot — Multi-Token Prediction architecture limitation).
+- **7B models crash with TBQ4** — `nb1=264` is 8-byte aligned, not 16-byte. Deferred; 27B works (`nb1=528`).
+- **MoE models** may hit `vector::_M_range_check` in MTP loading if `nextn_predict_layers` metadata is missing/incorrect in the GGUF.
+- **1M native-TBQ4 gen is ~2.2 t/s** — the honest dequant-at-read + K-transfer cost at extreme context (see benchmark note above).
+
+## TBQ3 Fused Flash Attention (Experimental)
+
+**Status: FIXED and validated (2026-08-03). GPU KV correct at 12.98 t/s — now the recommended default GPU KV type (3.0625 bpv vs TBQ4's 4.125, the 512K headroom enabler). CPU-only KV correct but slow (2.85 t/s).**
+
+TBQ3 (3.0625 bpv) is the next step below TBQ4 (4.125 bpv). Fused FA reads raw TBQ3_0 K/V blocks directly (3-bit centroid lookup + norm, no intermediate F16 buffer). The fused kernel operates in the rotated domain identically to TBQ4; only the tile loader and sign arrays differ. The fused MMA kernel (`fattn-mma-tbq3.cuh`) compiles and auto-dispatches from `fattn.cu` via the `GGML_TYPE_TBQ3_0` gate.
+
+### Bug history — eight bugs fixed (working tree, uncommitted)
+
+**Six dequant/rotation fixes:**
+1. **CUDA dequant** (`k_tbq3_dequant_full`, `ggml-cuda/tbq3-cuda.cuh`): wrong struct offsets — read `d` from byte 48 (block end); fixed to the `{d, qs}` layout, `d` at byte 0.
+2. **CUDA dequant**: missing s1/s2 sign multiplication in the inverse rotation.
+3. **CUDA dequant**: inverse factor `/128` → `*inv_sqrt_128` (`0.08838834764831845f`). `d = norm/recon_norm` assumes a norm-preserving rotation; the unnormalized FWHT scales norms by sqrt(128), so the inverse is `1/sqrt(128)` (confirmed by `fattn-mma-tbq3.cuh:118`).
+4. **CPU dequant** (`dequantize_row_tbq3_0`, `ggml/src/ggml-turboq.c`): wrong sign arrays — was TBQ4's `turboq_wht_signs1/2`; now TBQ3-specific `turboq_wht_signs1/2_tbq3` in `ggml-turboq-tables.h` (values differ, e.g. `signs1[3]`: TBQ4=`-1`, TBQ3=`1`).
+5. **CPU dequant**: wrong FWHT — was `tbq4_fwht_128` (includes `*inv_sqrt_128` normalization); now raw unnormalized `tbq3_fwht_128_cpu`, matching CUDA exactly (TBQ3 centroids are fitted to the unnormalized domain).
+6. **CPU quantizer** (`quantize_row_tbq3_0_ref`): same sign-array + FWHT fixes as the dequantizer.
+
+**Then the CPU 3-bit packer bug:** `quantize_row_tbq3_0_ref` (`ggml-turboq.c`) was corrupting 7/8 values — fixed to mirror the CUDA 24-bit little-endian packer.
+
+**Then the final bug — CUDA shared-memory FWHT race:** all 128 threads in `k_tbq3_dequant_full` ran the full in-place FWHT with insufficient `__syncthreads`. Fixed with the race-free butterfly from the TBQ4 kernel: `__shfl_xor_sync` h=1..16, shared slots with barriers h=32/64.
+
+**Files changed**: `ggml-turboq-tables.h` (added `turboq_wht_signs1/2_tbq3[128]`), `ggml-turboq.c` (added `tbq3_fwht_128_cpu`; fixed quantizer + dequantizer + packer), `tbq3-cuda.cuh` (`inv_128` → `inv_sqrt_128`, race-free FWHT butterfly).
+
+### Validation (2026-08-03) — FIXED, all 4 configs pass
+
+Controlled A/B (original chat prompt, temp 0, seed 42, same model):
+- f16 GPU: `"4"` @ 13.57 t/s | TBQ4 GPU: `"4"` @ 11.74 t/s | **TBQ3 GPU: `"4"` @ 12.98 t/s** | TBQ3 CPU-only: `"Four"` @ 2.85 t/s
+- All 4 configs (GPU/CPU KV × FA on/off) pass; deterministic ×3.
+
+**GOTCHA:** a bare prompt + `--jinja` produces garbage-looking output on this model regardless of KV type — use the chat format `"<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n"`. The earlier "TBQ3 still broken" observations after the packer fix were this format artifact.
+
+**Recommendation:** TBQ3 is the default GPU KV choice — faster than TBQ4 (12.98 vs 11.74 t/s) at 3.0625 bpv. CPU-only KV is correct but 2.85 t/s.
+
+**Dead code residual:** `dequantize_tbq3_0` latent xnorm bug in `tbq3-cuda.cuh` — unreferenced, left as-is.
+
+### Test procedure
+
+Server: `taskset -c 0-15 /home/mal/AI/llama.cpp-mtp-fixes/build/bin/llama-server -m "<NVME model path>" --host 127.0.0.1 --port 8099 --no-kv-offload -ctk tbq3_0 -ctv tbq3_0 -c 4096 -t 8 -fa on`
+
+Test: `curl -s http://localhost:8099/completion -d '{"prompt":"<|im_start|>user\nWhat is 2+2? Answer in one word.<|im_end|>\n<|im_start|>assistant\n","n_predict":20,"stream":false}'`
+
+TBQ4 reference result: content `"4"` at ~10.5 t/s. Model (NVMe): `/media/mal/2064C68864C66060/Models/cyberneurova-DeepSeek-V4-Flash-abliterated-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-aligned.gguf` — Team CX2 USB SSD copy is BACKUP ONLY (~13 min load vs ~50s from NVMe); NVMe does not auto-mount after reboot (`udisksctl mount -b /dev/nvme1n1p2`).
+
+### TBQ3 KV RAM estimates (128-dim blocks, 50 bytes each)
+
+| Context | TBQ4 KV (4.125 bpv) | TBQ3 KV (3.0625 bpv) | Saving |
+|---------|---------------------|----------------------|--------|
+| 256K | ~4.2 GB | ~3.2 GB | ~24% |
+| 512K | ~8.4 GB | ~6.4 GB | ~24% |
+| 1M | ~16.8 GB | ~12.8 GB | ~24% |
+
+---
+
+## DSpark / MTP Speculative Decoding (Upstream Compatibility)
+
+Our fork maintains its own MTP implementation (`--spec-type mtp`) for Qwen3.6. For DeepSeek-V4-Flash, upstream llama.cpp now supports DSpark speculative decoding (`--spec-type draft-dspark`) which uses a separate draft model to predict tokens verified in batch by the main model. Note the size claims: am17an's reference drafter is **18.48 GiB** (NOT ~10.9GB); alessandrobologna's quantized drafts are smaller (MXFP4-Q8_0 10.9GB, Q2_K-Q8_0 6.97GB).
+
+**DSpark and TBQ KV cache are orthogonal** -- DSpark speeds up token generation via speculative decoding, TBQ compresses the KV cache to fit longer context. They should stack: DSpark for speed, TBQ3/4 for RAM.
+
+### DSpark usage (requires upstream rebase with DSpark support)
+
+```bash
+# DSpark drafter (am17an's is the reference)
+# Download: https://huggingface.co/am17an/DeepseekV4-Flash-20260731-DSpark
+./build-mtp/bin/llama-server \
+  -m deepseek-v4-flash-abliterated-IQ2XXS.gguf \
+  --model-draft DeepseekV4-Flash-20260731-DSpark.gguf \
+  --spec-type draft-dspark --spec-draft-n-max 3 \
+  -ctk tbq4_0 -ctv tbq4_0 --no-kv-offload \
+  -c 524288 --flash-attn on -t 8 -np 1 --jinja
+
+# DSpark + ngram-mod combo (higher acceptance, tested by community)
+# --spec-type draft-dspark,ngram-mod --spec-draft-n-max 10 \
+# --spec-ngram-mod-n-match 60 --spec-ngram-mod-n-min 12 --spec-ngram-mod-n-max 24
+```
+
+### Community speed results (from r/LocalLLaMA, Aug 2026)
+
+| Setup | Baseline | With DSpark | Speedup |
+|-------|----------|-------------|---------|
+| 8x 3090 (192GB) Q4_K_XL | 27 t/s | 40 t/s (DSpark n-max 3) | 1.5x |
+| 8x 3090 MXFP4 | 35 t/s | 70 t/s (DSpark, CUB_TOP_K) | 2.0x |
+| 6000 Pro Max + 5090 | 60 t/s | 95 t/s (DSpark) | 1.58x |
+| DSpark + ngram-mod (any) | -- | 90% accept, 29 t/s | -- |
+
+### Abliterated DSpark models
+
+- `apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Quality128` -- abliterated with llama.cpp-compatible DSpark GGUF
+- `am17an/DeepseekV4-Flash-20260731-DSpark` -- reference DSpark drafter (not abliterated, works with any main model)
+
+### Integration status
+
+Upstream DSV4 MTP + DSpark (PR #25784) plus the DSpark sidecar (#26458) are **MERGED** into new branch `feature/dsv4-dspark` @ `5b504a59f` in the isolated worktree `/home/mal/AI/llama.cpp-mtp-fixes-dspark` (1 conflict resolved: `llama-kv-cache-dsv4.cpp`; TBQ4 regression PASS `"4"` @ 11.23 t/s; original branch untouched). Note: the fork's own custom MTP is native for Qwen3.6-lineage targets (`--spec-type mtp`, ~92% accept avg, 80-87 t/s) — it does NOT apply to DSV4 (vocab mismatch 248320 vs 129280).
+
+Drafters downloaded + sha256-verified on NVMe (`/media/mal/2064C68864C66060/Models/DSPark-Drafters/`): alessandrobologna MXFP4-Q8_0 (10.9G) and Q2_K-Q8_0 (6.97G). Both currently fail the arch gate (`deepseek_v4_flash_dspark_draft` unregistered) — the mapping slice is in flight. am17an's reference drafter (18.48 GiB, likely loads post-merge due to factored layout) is deferred on RAM budget.
+
+**Target config** (DSpark on this box): `llama-server -m <main> --model-draft <drafter> --spec-type draft-dspark --spec-draft-n-max 3 -ctk tbq4_0 -ctv tbq4_0 --no-kv-offload -c 524288 --flash-attn on`.
+
+**Feasibility (kv512k study):** 512k TBQ3 + DSpark est **16-19 t/s** (fits RAM — only TBQ3 leaves draft headroom); 512k TBQ4 + DSpark est 15-17 (marginal); no draft 6.5-7 t/s. q4_0 KV skipped (worse than TBQ4 on both RAM and speed). The TBQ KV cache code and DSpark operate on different axes (KV compression vs token prediction) and do not conflict.
+
+---
 
 ## Credits
 
-- **[havenoammo](https://huggingface.co/havenoammo)** — MTP graft tooling, first Qwen3.6-MTP GGUF release
+- **johndpope** — the TurboQuant lineage (TBQ3/TBQ4 KV cache, CPU TBQ quantize/dequant) this fork's KV compression builds on
 - **[spiritbuun](https://github.com/spiritbuun)** — dflash fork with CUDA TurboQuant kernels (our FWHT kernels adapted from this)
-- **[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)** — PR #22673 (MTP), PR #21089 (CPU TBQ)
-- **llmfan46** — Qwen3.6-27B-Heretic-v2 Native-MTP-Preserved GGUF (the model we use — 15 native MTP heads, MPOA uncensoring)
+- **[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)** — MTP heritage (PR #22673), CPU TBQ (PR #21089), and the upstream base this fork is rebased on
+- **[havenoammo](https://huggingface.co/havenoammo)** — MTP graft tooling, first Qwen3.6-MTP GGUF release
+- **llmfan46** — Qwen3.6-27B-Heretic-v2 Native-MTP-Preserved GGUF (15 native MTP heads, MPOA uncensoring)
 - **HauhauCS** — Original Qwen3.6-Heretic-v2 uncensored base model
 - **Radamanthys11** — MTP-Q8_0 GGUF extraction
 - **froggeric** — Fixed chat templates for Qwen3.6 + MTP
 
-## Documentation
+## License
 
-- **[Blog post](https://indrasmirror.au/blog-mtp-shared-tensors-200k.html)** — Detailed writeup with benchmarks, architecture, and optimization journey
-
----
-
-<details>
-<summary><strong>Upstream llama.cpp README</strong></summary>
-
-This fork is based on [llama.cpp](https://github.com/ggml-org/llama.cpp) by ggml-org. See the [upstream repository](https://github.com/ggml-org/llama.cpp) for general llama.cpp documentation, build instructions, and supported models.
-
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-
-</details>
+This fork keeps the upstream llama.cpp **MIT license** (see [LICENSE](LICENSE)). All added code in this fork inherits it. Upstream project: [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).

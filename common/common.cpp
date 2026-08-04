@@ -7,6 +7,7 @@
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
+#include "speculative.h"
 #include "unicode.h"
 
 #include <algorithm>
@@ -18,11 +19,6 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
-#include <mutex>
-
-#ifdef GGML_USE_CUDA
-#include <cuda_runtime.h>
-#endif
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -59,6 +55,10 @@
 #include <pwd.h>
 #endif
 
+#if defined(_AIX)
+#include <sys/systemcfg.h>
+#endif
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
@@ -76,7 +76,16 @@ common_time_meas::~common_time_meas() {
 //
 
 int32_t common_cpu_get_num_physical_cores() {
-#ifdef __linux__
+#if defined(_AIX)
+    int32_t logical_cpus = _system_configuration.ncpus;
+    int32_t smt_threads = _system_configuration.smt_threads;
+    if (smt_threads > 0) {
+        return static_cast<int32_t>(logical_cpus / smt_threads);
+    }
+    if (logical_cpus > 0) {
+        return static_cast<int32_t>(logical_cpus);
+    }
+#elif defined(__linux__)
     // enumerate the set of thread siblings, num entries is num cores
     std::unordered_set<std::string> siblings;
     for (uint32_t cpu=0; cpu < UINT32_MAX; ++cpu) {
@@ -206,6 +215,14 @@ int32_t common_cpu_get_num_math() {
             }
         }
     }
+#elif defined(__powerpc64__) || defined(__powerpc__)
+    int32_t smt_factor = 1;
+    int phy_cpus = common_cpu_get_num_physical_cores();
+    int logical_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (phy_cpus > 0 && logical_cpus > phy_cpus) {
+        smt_factor = logical_cpus / phy_cpus;
+    }
+    return phy_cpus * std::min(smt_factor, 2);
 #endif
     return common_cpu_get_num_physical_cores();
 }
@@ -229,7 +246,7 @@ bool set_process_priority(enum ggml_sched_priority prio) {
     }
 
     if (!SetPriorityClass(GetCurrentProcess(), p)) {
-        LOG_WRN("failed to set process priority class %d : (%d)\n", prio, (int) GetLastError());
+        COM_WRN("failed to set process priority class %d : (%d)\n", prio, (int) GetLastError());
         return false;
     }
 
@@ -255,7 +272,7 @@ bool set_process_priority(enum ggml_sched_priority prio) {
     }
 
     if (setpriority(PRIO_PROCESS, 0, p) != 0) {
-        LOG_WRN("failed to set process priority %d : %s (%d)\n", prio, strerror(errno), errno);
+        COM_WRN("failed to set process priority %d : %s (%d)\n", prio, strerror(errno), errno);
         return false;
     }
     return true;
@@ -288,14 +305,14 @@ void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_para
 
     if (n_set && n_set < cpuparams.n_threads) {
         // Not enough set bits, may experience performance issues.
-        LOG_WRN("Not enough set bits in CPU mask (%d) to satisfy requested thread count: %d\n", n_set, cpuparams.n_threads);
+        COM_WRN("Not enough set bits in CPU mask (%d) to satisfy requested thread count: %d\n", n_set, cpuparams.n_threads);
     }
 }
 
 bool parse_cpu_range(const std::string & range, bool (&boolmask)[GGML_MAX_N_THREADS]) {
     size_t dash_loc = range.find('-');
     if (dash_loc == std::string::npos) {
-        LOG_ERR("Format of CPU range is invalid! Expected [<start>]-[<end>].\n");
+        COM_ERR("%s", "Format of CPU range is invalid! Expected [<start>]-[<end>].\n");
         return false;
     }
 
@@ -307,7 +324,7 @@ bool parse_cpu_range(const std::string & range, bool (&boolmask)[GGML_MAX_N_THRE
     } else {
         start_i = std::stoull(range.substr(0, dash_loc));
         if (start_i >= GGML_MAX_N_THREADS) {
-            LOG_ERR("Start index out of bounds!\n");
+            COM_ERR("%s", "Start index out of bounds!\n");
             return false;
         }
     }
@@ -317,7 +334,7 @@ bool parse_cpu_range(const std::string & range, bool (&boolmask)[GGML_MAX_N_THRE
     } else {
         end_i = std::stoull(range.substr(dash_loc + 1));
         if (end_i >= GGML_MAX_N_THREADS) {
-            LOG_ERR("End index out of bounds!\n");
+            COM_ERR("%s", "End index out of bounds!\n");
             return false;
         }
     }
@@ -337,7 +354,7 @@ bool parse_cpu_mask(const std::string & mask, bool (&boolmask)[GGML_MAX_N_THREAD
     }
 
     size_t num_digits = mask.length() - start_i;
-    if (num_digits > 128) num_digits = 128;
+    num_digits = std::min<size_t>(num_digits, 128);
 
     size_t end_i = num_digits + start_i;
 
@@ -352,7 +369,7 @@ bool parse_cpu_mask(const std::string & mask, bool (&boolmask)[GGML_MAX_N_THREAD
         } else if (c >= 'A' && c <= 'F') {
             id -= 'A' - 10;
         } else {
-            LOG_ERR("Invalid hex character '%c' at position %d\n", c, int32_t(i));
+            COM_ERR("Invalid hex character '%c' at position %d\n", c, int32_t(i));
             return false;
         }
 
@@ -371,15 +388,33 @@ void common_init() {
     SetConsoleCP(CP_UTF8);
 #endif
 
-    llama_log_set(common_log_default_callback, NULL);
+    common_log_set_prefix(common_log_main(), true);
+    common_log_set_timestamps(common_log_main(), true);
 
+    llama_log_set(common_log_default_callback, NULL);
+}
+
+void common_params_print_info(const common_params & params, bool print_devices) {
 #ifdef NDEBUG
     const char * build_type = "";
 #else
     const char * build_type = " (debug)";
 #endif
+    COM_TRC("%s: build %d (%s) with %s for %s%s\n", __func__, llama_build_number(), llama_commit(), llama_compiler(), llama_build_target(), build_type);
 
-    LOG_DBG("build: %d (%s) with %s for %s%s\n", llama_build_number(), llama_commit(), llama_compiler(), llama_build_target(), build_type);
+    COM_INF("%s: verbosity = %d (adjust with the `-lv N` CLI arg)\n", __func__, common_log_get_verbosity_thold());
+
+    // device enumeration creates a primary context on CUDA backends, skip it when the caller does not own any device
+    if (print_devices) {
+        COM_TRC("%s", "device_info:\n");
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            auto * dev = ggml_backend_dev_get(i);
+            size_t free, total;
+            ggml_backend_dev_memory(dev, &free, &total);
+            COM_TRC("  - %-8s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / 1024 / 1024, free / 1024 / 1024);
+        }
+    }
+    COM_TRC("%s\n", common_params_get_system_info(params).c_str());
 }
 
 std::string common_params_get_system_info(const common_params & params) {
@@ -429,6 +464,27 @@ std::string string_strip(const std::string & str) {
         end--;
     }
     return str.substr(start, end - start);
+}
+
+std::string string_lcs(std::string_view a, std::string_view b) {
+    if (a.empty() || b.empty()) return {};
+
+    std::vector<std::vector<size_t>> dp(a.size() + 1, std::vector<size_t>(b.size() + 1, 0));
+    size_t best_len = 0;
+    size_t best_end_a = 0;
+
+    for (size_t i = 1; i <= a.size(); ++i) {
+        for (size_t j = 1; j <= b.size(); ++j) {
+            if (a[i - 1] == b[j - 1]) {
+                dp[i][j] = dp[i - 1][j - 1] + 1;
+                if (dp[i][j] > best_len) {
+                    best_len = dp[i][j];
+                    best_end_a = i;
+                }
+            }
+        }
+    }
+    return std::string(a.substr(best_end_a - best_len, best_len));
 }
 
 std::string string_get_sortable_timestamp() {
@@ -625,7 +681,7 @@ void string_process_escapes(std::string & input) {
 bool string_parse_kv_override(const char * data, std::vector<llama_model_kv_override> & overrides) {
     const char * sep = strchr(data, '=');
     if (sep == nullptr || sep - data >= 128) {
-        LOG_ERR("%s: malformed KV override '%s'\n", __func__, data);
+        COM_ERR("%s: malformed KV override '%s'\n", __func__, data);
         return false;
     }
     llama_model_kv_override kvo;
@@ -648,20 +704,20 @@ bool string_parse_kv_override(const char * data, std::vector<llama_model_kv_over
         } else if (std::strcmp(sep, "false") == 0) {
             kvo.val_bool = false;
         } else {
-            LOG_ERR("%s: invalid boolean value for KV override '%s'\n", __func__, data);
+            COM_ERR("%s: invalid boolean value for KV override '%s'\n", __func__, data);
             return false;
         }
     } else if (strncmp(sep, "str:", 4) == 0) {
         sep += 4;
         kvo.tag = LLAMA_KV_OVERRIDE_TYPE_STR;
         if (strlen(sep) > 127) {
-            LOG_ERR("%s: malformed KV override '%s', value cannot exceed 127 chars\n", __func__, data);
+            COM_ERR("%s: malformed KV override '%s', value cannot exceed 127 chars\n", __func__, data);
             return false;
         }
         strncpy(kvo.val_str, sep, 127);
         kvo.val_str[127] = '\0';
     } else {
-        LOG_ERR("%s: invalid type for KV override '%s'\n", __func__, data);
+        COM_ERR("%s: invalid type for KV override '%s'\n", __func__, data);
         return false;
     }
     overrides.emplace_back(std::move(kvo));
@@ -1039,6 +1095,18 @@ std::vector<common_file_info> fs_list(const std::string & path, bool include_dir
     return files;
 }
 
+std::ifstream fs_open_ifstream(const std::string & fname, std::ios_base::openmode mode) {
+#ifdef _WIN32
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, fname.c_str(), -1, NULL, 0);
+    if (!wlen) { return std::ifstream(); }
+    std::vector<wchar_t> wfname(wlen);
+    (void)MultiByteToWideChar(CP_UTF8, 0, fname.c_str(), -1, wfname.data(), wlen);
+    return std::ifstream(wfname.data(), mode);
+#else
+    return std::ifstream(fname, mode);
+#endif
+}
+
 //
 // TTY utils
 //
@@ -1113,7 +1181,7 @@ static void common_init_sampler_from_model(
         if (llama_model_meta_val_str(model, llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_SEQUENCE), buf, sizeof(buf)) > 0) {
             const std::vector<std::string> sampler_names = string_split<std::string>(std::string(buf), ';');
             if (!sampler_names.empty()) {
-                sparams.samplers = common_sampler_types_from_names(sampler_names, true);
+                sparams.samplers = common_sampler_types_from_names(sampler_names);
             }
         }
     }
@@ -1146,19 +1214,20 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
-common_init_result::common_init_result(common_params & params) :
+common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
     if (params.fit_params) {
-        LOG_INF("%s: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on\n", __func__);
+        COM_TRC("%s", "fitting params to device memory ...\n");
+        COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
-            params.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1168,6 +1237,10 @@ common_init_result::common_init_result(common_params & params) :
 
     pimpl->model.reset(model);
 
+    if (model_only) {
+        return;
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // load and optionally apply lora adapters
@@ -1175,8 +1248,7 @@ common_init_result::common_init_result(common_params & params) :
         llama_adapter_lora_ptr lora;
         lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
         if (lora == nullptr) {
-            LOG_ERR("%s: failed to load lora adapter '%s'\n", __func__, la.path.c_str());
-            pimpl->model.reset(model);
+            COM_ERR("failed to load lora adapter '%s'\n", la.path.c_str());
             return;
         }
 
@@ -1194,14 +1266,14 @@ common_init_result::common_init_result(common_params & params) :
     common_init_sampler_from_model(model, params.sampling);
 
     if (params.sampling.ignore_eos && llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
-        LOG_WRN("%s: warning: vocab does not have an EOS token, ignoring --ignore-eos\n", __func__);
+        COM_WRN("%s", "vocab does not have an EOS token, ignoring --ignore-eos\n");
         params.sampling.ignore_eos = false;
     }
 
     // initialize once
     for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {
         if (llama_vocab_is_eog(vocab, i)) {
-            LOG_INF("%s: added %s logit bias = %f\n", __func__, common_token_to_piece(vocab, i).c_str(), -INFINITY);
+            COM_TRC("added %s logit bias = %f\n", common_token_to_piece(vocab, i).c_str(), -INFINITY);
             params.sampling.logit_bias_eog.push_back({i, -INFINITY});
         }
     }
@@ -1214,12 +1286,12 @@ common_init_result::common_init_result(common_params & params) :
     }
 
     //if (params.sampling.penalty_last_n == -1) {
-    //    LOG_INF("%s: setting penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
+    //    LOG_TRC("%s: setting penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
     //    params.sampling.penalty_last_n = llama_n_ctx(lctx);
     //}
 
     //if (params.sampling.dry_penalty_last_n == -1) {
-    //    LOG_INF("%s: setting dry_penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
+    //    LOG_TRC("%s: setting dry_penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
     //    params.sampling.dry_penalty_last_n = llama_n_ctx(lctx);
     //}
 
@@ -1239,7 +1311,7 @@ common_init_result::common_init_result(common_params & params) :
 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
-        LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
+        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;
     }
 
@@ -1271,25 +1343,29 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
-common_init_result_ptr common_init_from_params(common_params & params) {
-    common_init_result_ptr res(new common_init_result(params));
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();
     if (model == NULL) {
-        LOG_ERR("%s: failed to load model '%s'\n", __func__, params.model.path.c_str());
+        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
+        return res;
+    }
+
+    if (model_only) {
         return res;
     }
 
     llama_context * lctx = res->context();
     if (lctx == NULL) {
-        LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
+        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return res;
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
-        LOG_WRN("%s: KV cache shifting is not supported for this context, disabling KV cache shifting\n", __func__);
+        COM_WRN("%s", "KV cache shifting is not supported for this context, disabling KV cache shifting\n");
         params.ctx_shift = false;
     }
 
@@ -1318,7 +1394,7 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         bool ok = true;
 
         if (llama_vocab_bos(vocab) == LLAMA_TOKEN_NULL) {
-            LOG_WRN("%s: warning: vocab does not have a  BOS token, reranking will not work\n", __func__);
+            COM_WRN("%s", "vocab does not have a  BOS token, reranking will not work\n");
             ok = false;
         }
 
@@ -1327,10 +1403,10 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         bool has_rerank_prompt = llama_model_chat_template(model, "rerank") != NULL;
 
         if (!has_eos && !has_sep && !has_rerank_prompt) {
-            LOG_WRN("%s: warning: vocab does not have an EOS token, SEP token, or rerank prompt. Reranking will not work\n", __func__);
+            COM_WRN("%s", "vocab does not have an EOS token, SEP token, or rerank prompt. Reranking will not work\n");
             ok = false;
         } else if (!has_eos) {
-            LOG_WRN("%s: warning: vocab does not have an EOS token, using SEP token as fallback\n", __func__);
+            COM_WRN("%s", "vocab does not have an EOS token, using SEP token as fallback\n");
         }
 
         if (!ok) {
@@ -1343,9 +1419,7 @@ common_init_result_ptr common_init_from_params(common_params & params) {
     }
 
     if (params.warmup) {
-        LOG_WRN("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
-
-        llama_set_warmup(lctx, true);
+        COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
 
         std::vector<llama_token> tmp;
         llama_token bos = llama_vocab_bos(vocab);
@@ -1377,7 +1451,6 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
-        llama_set_warmup(lctx, false);
 
         // reset samplers to reset RNG state after warmup to the seeded state
         res->reset_samplers();
@@ -1403,6 +1476,20 @@ std::string common_get_model_endpoint() {
     return model_endpoint;
 }
 
+char * common_get_model_or_exit(int argc, char * argv[]) {
+    if (argc > 1) {
+        return argv[1];
+    }
+
+    char * path = getenv("LLAMACPP_TEST_MODELFILE");
+    if (!path || strlen(path) == 0) {
+        fprintf(stderr, "\033[33mWARNING: No model file provided. Skipping this test. Set LLAMACPP_TEST_MODELFILE=<gguf_model_path> to silence this warning and run this test.\n\033[0m");
+        exit(EXIT_SUCCESS);
+    }
+
+    return path;
+}
+
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     auto * mem = llama_get_memory(ctx);
     if (mem == nullptr) {
@@ -1420,19 +1507,20 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
 
     int ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
     if (ret != 0) {
-        LOG_ERR("%s: llama_decode() failed: %d\n", __func__, ret);
+        COM_ERR("llama_decode() failed: %d\n", ret);
         res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
         goto done;
     }
 
     if (llama_n_rs_seq(ctx) > 0) {
-        res = COMMON_CONTEXT_SEQ_RM_TYPE_PART_BOUNDED;
+        COM_TRC("%s", "the context supports bounded partial sequence removal\n");
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_RS;
         goto done;
     }
 
     // try to remove the last tokens
     if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
-        LOG_WRN("%s: the context does not support partial sequence removal\n", __func__);
+        COM_TRC("%s", "the context does not support partial sequence removal\n");
         res = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
         goto done;
     }
@@ -1442,6 +1530,49 @@ done:
     llama_synchronize(ctx);
 
     return res;
+}
+
+static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    auto * mem = llama_get_memory(ctx);
+    if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
+        GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
+    }
+}
+
+static void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    auto * mem = llama_get_memory(ctx);
+    llama_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
+}
+
+static void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
+    auto * mem = llama_get_memory(ctx);
+    llama_memory_seq_add(mem, seq_id, p0, p1, delta);
+}
+
+void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft) {
+    this->ctx_tgt = ctx_tgt;
+    this->ctx_dft = ctx_dft;
+}
+
+void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
+    if (ctx_dft) {
+        common_context_seq_rm(ctx_dft, seq_id, p0, p1);
+    }
+}
+
+void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const {
+    common_context_seq_cp(ctx_tgt, seq_id_src, seq_id_dst, p0, p1);
+    if (ctx_dft) {
+        common_context_seq_cp(ctx_dft, seq_id_src, seq_id_dst, p0, p1);
+    }
+}
+
+void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const {
+    common_context_seq_add(ctx_tgt, seq_id, p0, p1, delta);
+    if (ctx_dft) {
+        common_context_seq_add(ctx_dft, seq_id, p0, p1, delta);
+    }
 }
 
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
@@ -1466,10 +1597,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.n_gpu_layers    = params.n_gpu_layers;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
+    mparams.load_mode       = params.load_mode;
     mparams.tensor_split    = params.tensor_split;
-    mparams.use_mmap        = params.use_mmap;
-    mparams.use_direct_io   = params.use_direct_io;
-    mparams.use_mlock       = params.use_mlock;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
@@ -1491,6 +1620,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
+    mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;
 }
@@ -1500,12 +1630,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
-    {
-        // enable partial rollback only for MTP, each recurrent slot requires memory
-        // and MTP uses max 3-4 slots vs other techniques
-        const bool has_mtp_spec = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_MTP) != params.speculative.types.end();
-        cparams.n_rs_seq = has_mtp_spec ? (uint32_t) params.speculative.draft.n_max : 0u;
-    }
+    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;
@@ -1736,13 +1862,13 @@ static common_control_vector_data common_control_vector_load_one(const common_co
     };
     struct gguf_context * ctx_gguf = gguf_init_from_file(load_info.fname.c_str(), meta_gguf_params);
     if (!ctx_gguf) {
-        LOG_ERR("%s: failed to load control vector file from %s\n", __func__, load_info.fname.c_str());
+        COM_ERR("failed to load control vector file from %s\n", load_info.fname.c_str());
         return result;
     }
 
     int32_t n_tensors = gguf_get_n_tensors(ctx_gguf);
     if (n_tensors == 0) {
-        LOG_WRN("%s: no direction tensors found in %s\n", __func__, load_info.fname.c_str());
+        COM_WRN("no direction tensors found in %s\n", load_info.fname.c_str());
     }
 
     for (int i = 0; i < n_tensors; i++) {
@@ -1760,23 +1886,23 @@ static common_control_vector_data common_control_vector_load_one(const common_co
             }
         }
         if (layer_idx < 0) {
-            LOG_ERR("%s: invalid/unparsable direction tensor layer index in %s\n", __func__, load_info.fname.c_str());
+            COM_ERR("invalid/unparsable direction tensor layer index in %s\n", load_info.fname.c_str());
             result.n_embd = -1;
             break;
         } else if (layer_idx == 0) {
-            LOG_ERR("%s: invalid (zero) direction tensor layer index in %s\n", __func__, load_info.fname.c_str());
+            COM_ERR("invalid (zero) direction tensor layer index in %s\n", load_info.fname.c_str());
             result.n_embd = -1;
             break;
         }
 
         struct ggml_tensor * tensor = ggml_get_tensor(ctx, name.c_str());
         if (tensor->type != GGML_TYPE_F32) {
-            LOG_ERR("%s: invalid (non-F32) direction tensor type in %s\n", __func__, load_info.fname.c_str());
+            COM_ERR("invalid (non-F32) direction tensor type in %s\n", load_info.fname.c_str());
             result.n_embd = -1;
             break;
         }
         if (ggml_n_dims(tensor) != 1) {
-            LOG_ERR("%s: invalid (non-1D) direction tensor shape in %s\n", __func__, load_info.fname.c_str());
+            COM_ERR("invalid (non-1D) direction tensor shape in %s\n", load_info.fname.c_str());
             result.n_embd = -1;
             break;
         }
@@ -1784,7 +1910,7 @@ static common_control_vector_data common_control_vector_load_one(const common_co
         if (result.n_embd == -1) {
             result.n_embd = ggml_nelements(tensor);
         } else if (ggml_nelements(tensor) != result.n_embd) {
-            LOG_ERR("%s: direction tensor in %s does not match previous dimensions\n", __func__, load_info.fname.c_str());
+            COM_ERR("direction tensor in %s does not match previous dimensions\n", load_info.fname.c_str());
             result.n_embd = -1;
             break;
         }
@@ -1801,7 +1927,7 @@ static common_control_vector_data common_control_vector_load_one(const common_co
     }
 
     if (result.n_embd == -1) {
-        LOG_WRN("%s: skipping %s due to invalid direction tensors\n", __func__, load_info.fname.c_str());
+        COM_WRN("skipping %s due to invalid direction tensors\n", load_info.fname.c_str());
         result.data.clear();
     }
 
@@ -1822,7 +1948,7 @@ common_control_vector_data common_control_vector_load(const std::vector<common_c
             break;
         }
         if (result.n_embd != -1 && result.n_embd != cur.n_embd) {
-            LOG_ERR("%s: control vectors in %s does not match previous dimensions\n", __func__, info.fname.c_str());
+            COM_ERR("control vectors in %s does not match previous dimensions\n", info.fname.c_str());
             result.n_embd = -1;
             break;
         }
@@ -1838,7 +1964,7 @@ common_control_vector_data common_control_vector_load(const std::vector<common_c
     }
 
     if (result.n_embd == -1) {
-        LOG_ERR("%s: no valid control vector files passed\n", __func__);
+        COM_ERR("%s", "no valid control vector files passed\n");
         result.data.clear();
     }
 
@@ -1927,126 +2053,59 @@ bool common_replay_last_token(struct llama_context * ctx, llama_token last_token
 
 bool common_prompt_batch_decode(
               struct llama_context * ctx,
-    const std::vector<llama_token> & tokens,
+    const std::vector<llama_token> & all_tokens,
+                               int   n_new,
                                int & n_past,
                                int   n_batch,
                   std::string_view   state_path,
                               bool   save_state) {
-    const int n_eval = tokens.size();
-    if (n_eval == 0) {
+    if (n_new == 0) {
         return true;
     }
+    const int offset = all_tokens.size() - n_new;
 
-    if (save_state && n_eval > 1) {
-        const int n_tokens_before_last = n_eval - 1;
+    if (save_state && n_new > 1) {
+        const int n_tokens_before_last = n_new - 1;
 
-        GGML_ASSERT(n_eval <= n_batch);
+        GGML_ASSERT(n_new <= n_batch);
 
         // Decode all but the last token so we can save the memory state before decoding the last token.
         // This is done so we can restore the session state later and replay the last token.
         // Memory implementations in recurrent/hybrid models don't support removing tokens from their
         // memory, so we can't just remove the last token from the memory and replay the last token which
         // is the reason for this logic.
-        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(tokens.data()), n_tokens_before_last))) {
-            LOG_ERR("%s : failed to eval\n", __func__);
+        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(all_tokens.data() + offset), n_tokens_before_last))) {
+            COM_ERR("%s", "failed to eval\n");
             return false;
         }
         n_past += n_tokens_before_last;
 
-        llama_state_save_file(ctx, state_path.data(), tokens.data(), n_tokens_before_last);
-        LOG_INF("saved session before last token to %s, n_tokens = %d\n", state_path.data(), n_tokens_before_last);
+        llama_state_save_file(ctx, state_path.data(), all_tokens.data(), all_tokens.size());
+        COM_INF("saved session before last token to %s, n_new = %zu\n", state_path.data(), all_tokens.size());
 
-        llama_token last_token = tokens.back();
+        llama_token last_token = all_tokens.back();
         llama_batch batch = llama_batch_get_one(&last_token, 1);
         int32_t pos = n_past;
         batch.pos = &pos;
 
         if (llama_decode(ctx, batch)) {
-            LOG_ERR("%s : failed to eval last token\n", __func__);
+            COM_ERR("%s", "failed to eval last token\n");
             return false;
         }
         n_past++;
     } else {
-        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(tokens.data()), n_eval))) {
-            LOG_ERR("%s : failed to eval\n", __func__);
+        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(all_tokens.data() + offset), n_new))) {
+            COM_ERR("%s", "failed to eval\n");
             return false;
         }
-        n_past += n_eval;
+        n_past += n_new;
     }
 
     return true;
 }
 
-#ifdef GGML_USE_CUDA
-// RTX-4090 / NVIDIA-dedicated: small rotating pool of PINNED host buffers used as
-// staging for async checkpoint D2H copies. Bounded to N slots (~2x max checkpoint
-// size) so pinned (locked) RAM stays tiny; the CUDA host callback releases a slot
-// as soon as its copy finishes (~ms), long before the next checkpoint is created.
-namespace {
-
-struct ckpt_staging_pool {
-    static constexpr int N = 2;
-
-    uint8_t * buf[N]  = {nullptr};
-    size_t    cap[N]  = {0};
-    bool      busy[N] = {false};
-    std::mutex mtx;
-
-    int acquire(size_t need) {
-        std::lock_guard<std::mutex> lk(mtx);
-        for (int i = 0; i < N; ++i) {
-            if (!busy[i]) {
-                if (cap[i] < need) {
-                    if (buf[i]) {
-                        cudaFreeHost(buf[i]);
-                    }
-                    cudaHostAlloc((void **)&buf[i], need, cudaHostAllocDefault);
-                    cap[i] = need;
-                }
-                busy[i] = true;
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    void release(int i) {
-        std::lock_guard<std::mutex> lk(mtx);
-        if (i >= 0 && i < N) {
-            busy[i] = false;
-        }
-    }
-
-    uint8_t * ptr(int i) { return (i >= 0 && i < N) ? buf[i] : nullptr; }
-};
-
-ckpt_staging_pool g_ckpt_staging;
-
-struct ckpt_cb_data {
-    uint8_t *          dst;    // data_tgt/data_dft (stable: checkpoint lives in a std::list)
-    size_t             size;
-    int                slot;
-    std::atomic<bool> *copied;
-};
-
-void ckpt_host_cb(void * p) {
-    auto * d = static_cast<ckpt_cb_data *>(p);
-    uint8_t * staging = g_ckpt_staging.ptr(d->slot);
-    if (staging && d->dst) {
-        memcpy(d->dst, staging, d->size);
-    }
-    if (d->copied) {
-        d->copied->store(true, std::memory_order_release);
-    }
-    g_ckpt_staging.release(d->slot);
-    delete d;
-}
-
-} // namespace
-#endif
-
 size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size();
+    return data_tgt.size() + data_dft.size() + data_spec.size();
 }
 
 bool common_prompt_checkpoint::empty() const {
@@ -2054,29 +2113,6 @@ bool common_prompt_checkpoint::empty() const {
 }
 
 void common_prompt_checkpoint::clear() {
-#ifdef GGML_USE_CUDA
-    if (async_active_tgt && !copied_tgt.load()) {
-        cudaStreamSynchronize(cudaStreamPerThread);
-    }
-    if (async_active_dft && !copied_dft.load()) {
-        cudaStreamSynchronize(cudaStreamPerThread);
-    }
-    if (async_active_tgt && cuda_event_tgt) {
-        cudaEventDestroy((cudaEvent_t) cuda_event_tgt);
-    }
-    if (async_active_dft && cuda_event_dft) {
-        cudaEventDestroy((cudaEvent_t) cuda_event_dft);
-    }
-    async_active_tgt   = false;
-    async_active_dft   = false;
-    cuda_event_tgt     = nullptr;
-    cuda_event_dft     = nullptr;
-    staging_slot_tgt   = -1;
-    staging_slot_dft   = -1;
-    copied_tgt.store(true);
-    copied_dft.store(true);
-#endif
-
     n_tokens = 0;
 
     pos_min = 0;
@@ -2084,119 +2120,7 @@ void common_prompt_checkpoint::clear() {
 
     data_tgt.clear();
     data_dft.clear();
-}
-
-common_prompt_checkpoint::~common_prompt_checkpoint() {
-#ifdef GGML_USE_CUDA
-    // wait for any in-flight async capture callback, then free the CUDA event
-    if (async_active_tgt && !copied_tgt.load()) {
-        cudaStreamSynchronize(cudaStreamPerThread);
-    }
-    if (async_active_dft && !copied_dft.load()) {
-        cudaStreamSynchronize(cudaStreamPerThread);
-    }
-    if (async_active_tgt && cuda_event_tgt) {
-        cudaEventDestroy((cudaEvent_t) cuda_event_tgt);
-    }
-    if (async_active_dft && cuda_event_dft) {
-        cudaEventDestroy((cudaEvent_t) cuda_event_dft);
-    }
-    // staging slots are released by the host callback; if it is somehow still
-    // pending, the stream sync above guarantees it has run by now.
-#endif
-}
-
-common_prompt_checkpoint::common_prompt_checkpoint(common_prompt_checkpoint && o) noexcept
-    : n_tokens(o.n_tokens),
-      pos_min(o.pos_min),
-      pos_max(o.pos_max),
-      data_tgt(std::move(o.data_tgt)),
-      data_dft(std::move(o.data_dft))
-#ifdef GGML_USE_CUDA
-      , cuda_event_tgt(o.cuda_event_tgt)
-      , cuda_event_dft(o.cuda_event_dft)
-      , staging_slot_tgt(o.staging_slot_tgt)
-      , staging_slot_dft(o.staging_slot_dft)
-      , copied_tgt(o.copied_tgt.load())
-      , copied_dft(o.copied_dft.load())
-      , async_active_tgt(o.async_active_tgt)
-      , async_active_dft(o.async_active_dft)
-#endif
-{
-#ifdef GGML_USE_CUDA
-    // take ownership; clear source so its destructor leaves our resources alone
-    o.cuda_event_tgt   = nullptr;
-    o.cuda_event_dft   = nullptr;
-    o.staging_slot_tgt = -1;
-    o.staging_slot_dft = -1;
-    o.async_active_tgt = false;
-    o.async_active_dft = false;
-    o.copied_tgt.store(true);
-    o.copied_dft.store(true);
-#endif
-}
-
-common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_checkpoint && o) noexcept {
-    if (this != &o) {
-        // free any resources we currently own
-        this->clear();
-
-        n_tokens = o.n_tokens;
-        pos_min  = o.pos_min;
-        pos_max  = o.pos_max;
-        data_tgt = std::move(o.data_tgt);
-        data_dft = std::move(o.data_dft);
-
-#ifdef GGML_USE_CUDA
-        cuda_event_tgt   = o.cuda_event_tgt;
-        cuda_event_dft   = o.cuda_event_dft;
-        staging_slot_tgt = o.staging_slot_tgt;
-        staging_slot_dft = o.staging_slot_dft;
-        copied_tgt.store(o.copied_tgt.load());
-        copied_dft.store(o.copied_dft.load());
-        async_active_tgt = o.async_active_tgt;
-        async_active_dft = o.async_active_dft;
-
-        o.cuda_event_tgt   = nullptr;
-        o.cuda_event_dft   = nullptr;
-        o.staging_slot_tgt = -1;
-        o.staging_slot_dft = -1;
-        o.async_active_tgt = false;
-        o.async_active_dft = false;
-        o.copied_tgt.store(true);
-        o.copied_dft.store(true);
-#endif
-    }
-    return *this;
-}
-
-common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoint & o)
-    : n_tokens(o.n_tokens),
-      pos_min(o.pos_min),
-      pos_max(o.pos_max),
-      data_tgt(o.data_tgt),
-      data_dft(o.data_dft)
-#ifdef GGML_USE_CUDA
-      , copied_tgt(o.copied_tgt.load())
-      , copied_dft(o.copied_dft.load())
-      // cuda_event_*/staging_slot_*/async_active_* stay at defaults: copies only
-      // occur at prompt setup with an inactive capture.
-#endif
-{
-}
-
-common_prompt_checkpoint & common_prompt_checkpoint::operator=(const common_prompt_checkpoint & o) {
-    if (this != &o) {
-        this->clear();
-
-        n_tokens = o.n_tokens;
-        pos_min  = o.pos_min;
-        pos_max  = o.pos_max;
-        data_tgt = o.data_tgt;
-        data_dft = o.data_dft;
-        // keep async state at defaults
-    }
-    return *this;
+    data_spec.clear();
 }
 
 void common_prompt_checkpoint::update_pos(
@@ -2220,35 +2144,10 @@ void common_prompt_checkpoint::update_tgt(
 
     data_tgt.resize(ckpt_size);
 
-#ifdef GGML_USE_CUDA
-    // RTX-4090 / NVIDIA-dedicated: capture asynchronously into a pinned staging
-    // buffer so the D2H transfer overlaps with subsequent prefill compute.
-    int slot = g_ckpt_staging.acquire(ckpt_size);
-    if (slot < 0) {
-        // both staging slots busy (should not happen in practice): drain and retry
-        cudaStreamSynchronize(cudaStreamPerThread);
-        slot = g_ckpt_staging.acquire(ckpt_size);
-    }
-    GGML_ASSERT(slot >= 0 && "ckpt staging pool exhausted");
-
-    cudaEvent_t ev;
-    const size_t n = llama_state_seq_get_data_ext_async(ctx, g_ckpt_staging.ptr(slot), ckpt_size, seq_id, flags, &ev);
-    if (n != ckpt_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
-    }
-    cuda_event_tgt   = ev;
-    staging_slot_tgt = slot;
-    copied_tgt.store(false, std::memory_order_relaxed);
-    async_active_tgt = true;
-
-    ckpt_cb_data * d = new ckpt_cb_data{data_tgt.data(), ckpt_size, slot, &copied_tgt};
-    cudaLaunchHostFunc(cudaStreamPerThread, ckpt_host_cb, d);
-#else
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
-#endif
 }
 
 void common_prompt_checkpoint::update_dft(
@@ -2263,32 +2162,10 @@ void common_prompt_checkpoint::update_dft(
 
     data_dft.resize(ckpt_size);
 
-#ifdef GGML_USE_CUDA
-    int slot = g_ckpt_staging.acquire(ckpt_size);
-    if (slot < 0) {
-        cudaStreamSynchronize(cudaStreamPerThread);
-        slot = g_ckpt_staging.acquire(ckpt_size);
-    }
-    GGML_ASSERT(slot >= 0 && "ckpt staging pool exhausted");
-
-    cudaEvent_t ev;
-    const size_t n = llama_state_seq_get_data_ext_async(ctx, g_ckpt_staging.ptr(slot), ckpt_size, seq_id, flags, &ev);
-    if (n != ckpt_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
-    }
-    cuda_event_dft   = ev;
-    staging_slot_dft = slot;
-    copied_dft.store(false, std::memory_order_relaxed);
-    async_active_dft = true;
-
-    ckpt_cb_data * d = new ckpt_cb_data{data_dft.data(), ckpt_size, slot, &copied_dft};
-    cudaLaunchHostFunc(cudaStreamPerThread, ckpt_host_cb, d);
-#else
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
-#endif
 }
 
 void common_prompt_checkpoint::load_tgt(
@@ -2302,13 +2179,6 @@ void common_prompt_checkpoint::load_tgt(
     if (data_tgt.empty()) {
         return;
     }
-
-#ifdef GGML_USE_CUDA
-    // ensure the async capture + host callback finished before reading data_tgt
-    if (async_active_tgt && !copied_tgt.load(std::memory_order_acquire)) {
-        cudaStreamSynchronize(cudaStreamPerThread);
-    }
-#endif
 
     const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
     if (n != data_tgt.size()) {
@@ -2328,14 +2198,17 @@ void common_prompt_checkpoint::load_dft(
         return;
     }
 
-#ifdef GGML_USE_CUDA
-    if (async_active_dft && !copied_dft.load(std::memory_order_acquire)) {
-        cudaStreamSynchronize(cudaStreamPerThread);
-    }
-#endif
-
     const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
     if (n != data_dft.size()) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
     }
+}
+
+void common_prompt_checkpoint::clear_tgt() {
+    data_tgt.clear();
+}
+
+void common_prompt_checkpoint::clear_dft() {
+    data_dft.clear();
+    data_spec.clear();
 }
