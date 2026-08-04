@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
+#include "llama.h"
 
 #include <algorithm>
 #include <array>
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <vector>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -27,51 +29,54 @@ const char * llama_file_version_name(llama_fver version) {
     return "unknown";
 }
 
-static std::string llama_model_ftype_name(llama_ftype ftype) {
-    if (ftype & LLAMA_FTYPE_GUESSED) {
-        return llama_model_ftype_name((enum llama_ftype) (ftype & ~LLAMA_FTYPE_GUESSED)) + " (guessed)";
-    }
+#define LLAMA_FTYPE_PREFIX "(guessed) "
 
-    switch (ftype) {
-        case LLAMA_FTYPE_ALL_F32:         return "all F32";
-        case LLAMA_FTYPE_MOSTLY_F16:      return "F16";
-        case LLAMA_FTYPE_MOSTLY_BF16:     return "BF16";
-        case LLAMA_FTYPE_MOSTLY_Q1_0:     return "Q1_0";
-        case LLAMA_FTYPE_MOSTLY_Q4_0:     return "Q4_0";
-        case LLAMA_FTYPE_MOSTLY_Q4_1:     return "Q4_1";
-        case LLAMA_FTYPE_MOSTLY_Q5_0:     return "Q5_0";
-        case LLAMA_FTYPE_MOSTLY_Q5_1:     return "Q5_1";
-        case LLAMA_FTYPE_MOSTLY_Q8_0:     return "Q8_0";
-        case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return "MXFP4 MoE";
-        case LLAMA_FTYPE_MOSTLY_NVFP4:    return "NVFP4";
-        case LLAMA_FTYPE_MOSTLY_Q2_K:     return "Q2_K - Medium";
-        case LLAMA_FTYPE_MOSTLY_Q2_K_S:   return "Q2_K - Small";
-        case LLAMA_FTYPE_MOSTLY_Q3_K_S:   return "Q3_K - Small";
-        case LLAMA_FTYPE_MOSTLY_Q3_K_M:   return "Q3_K - Medium";
-        case LLAMA_FTYPE_MOSTLY_Q3_K_L:   return "Q3_K - Large";
-        case LLAMA_FTYPE_MOSTLY_Q4_K_S:   return "Q4_K - Small";
-        case LLAMA_FTYPE_MOSTLY_Q4_K_M:   return "Q4_K - Medium";
-        case LLAMA_FTYPE_MOSTLY_Q5_K_S:   return "Q5_K - Small";
-        case LLAMA_FTYPE_MOSTLY_Q5_K_M:   return "Q5_K - Medium";
-        case LLAMA_FTYPE_MOSTLY_Q6_K:     return "Q6_K";
-        case LLAMA_FTYPE_MOSTLY_TQ1_0:    return "TQ1_0 - 1.69 bpw ternary";
-        case LLAMA_FTYPE_MOSTLY_TQ2_0:    return "TQ2_0 - 2.06 bpw ternary";
-        case LLAMA_FTYPE_MOSTLY_IQ2_XXS:  return "IQ2_XXS - 2.0625 bpw";
-        case LLAMA_FTYPE_MOSTLY_IQ2_XS:   return "IQ2_XS - 2.3125 bpw";
-        case LLAMA_FTYPE_MOSTLY_IQ2_S:    return "IQ2_S - 2.5 bpw";
-        case LLAMA_FTYPE_MOSTLY_IQ2_M:    return "IQ2_M - 2.7 bpw";
-        case LLAMA_FTYPE_MOSTLY_IQ3_XS:   return "IQ3_XS - 3.3 bpw";
-        case LLAMA_FTYPE_MOSTLY_IQ3_XXS:  return "IQ3_XXS - 3.0625 bpw";
-        case LLAMA_FTYPE_MOSTLY_IQ1_S:    return "IQ1_S - 1.5625 bpw";
-        case LLAMA_FTYPE_MOSTLY_IQ1_M:    return "IQ1_M - 1.75 bpw";
-        case LLAMA_FTYPE_MOSTLY_IQ4_NL:   return "IQ4_NL - 4.5 bpw";
-        case LLAMA_FTYPE_MOSTLY_IQ4_XS:   return "IQ4_XS - 4.25 bpw";
-        case LLAMA_FTYPE_MOSTLY_IQ3_S:    return "IQ3_S - 3.4375 bpw";
-        case LLAMA_FTYPE_MOSTLY_IQ3_M:    return "IQ3_S mix - 3.66 bpw";
-
-        default: return "unknown, may not work";
+const char * llama_ftype_name(llama_ftype ftype) {
+    static constexpr size_t guessed_prefix_len = sizeof(LLAMA_FTYPE_PREFIX) - 1;
+    const char * name;
+    switch ((enum llama_ftype) (ftype & ~LLAMA_FTYPE_GUESSED)) {
+        case LLAMA_FTYPE_ALL_F32:          name = LLAMA_FTYPE_PREFIX "all F32"; break;
+        case LLAMA_FTYPE_MOSTLY_F16:       name = LLAMA_FTYPE_PREFIX "F16"; break;
+        case LLAMA_FTYPE_MOSTLY_BF16:      name = LLAMA_FTYPE_PREFIX "BF16"; break;
+        case LLAMA_FTYPE_MOSTLY_Q1_0:      name = LLAMA_FTYPE_PREFIX "Q1_0"; break;
+        case LLAMA_FTYPE_MOSTLY_Q2_0:      name = LLAMA_FTYPE_PREFIX "Q2_0"; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0:      name = LLAMA_FTYPE_PREFIX "Q4_0"; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_1:      name = LLAMA_FTYPE_PREFIX "Q4_1"; break;
+        case LLAMA_FTYPE_MOSTLY_Q5_0:      name = LLAMA_FTYPE_PREFIX "Q5_0"; break;
+        case LLAMA_FTYPE_MOSTLY_Q5_1:      name = LLAMA_FTYPE_PREFIX "Q5_1"; break;
+        case LLAMA_FTYPE_MOSTLY_Q8_0:      name = LLAMA_FTYPE_PREFIX "Q8_0"; break;
+        case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: name = LLAMA_FTYPE_PREFIX "MXFP4 MoE"; break;
+        case LLAMA_FTYPE_MOSTLY_NVFP4:     name = LLAMA_FTYPE_PREFIX "NVFP4"; break;
+        case LLAMA_FTYPE_MOSTLY_Q2_K:      name = LLAMA_FTYPE_PREFIX "Q2_K - Medium"; break;
+        case LLAMA_FTYPE_MOSTLY_Q2_K_S:    name = LLAMA_FTYPE_PREFIX "Q2_K - Small"; break;
+        case LLAMA_FTYPE_MOSTLY_Q3_K_S:    name = LLAMA_FTYPE_PREFIX "Q3_K - Small"; break;
+        case LLAMA_FTYPE_MOSTLY_Q3_K_M:    name = LLAMA_FTYPE_PREFIX "Q3_K - Medium"; break;
+        case LLAMA_FTYPE_MOSTLY_Q3_K_L:    name = LLAMA_FTYPE_PREFIX "Q3_K - Large"; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_K_S:    name = LLAMA_FTYPE_PREFIX "Q4_K - Small"; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_K_M:    name = LLAMA_FTYPE_PREFIX "Q4_K - Medium"; break;
+        case LLAMA_FTYPE_MOSTLY_Q5_K_S:    name = LLAMA_FTYPE_PREFIX "Q5_K - Small"; break;
+        case LLAMA_FTYPE_MOSTLY_Q5_K_M:    name = LLAMA_FTYPE_PREFIX "Q5_K - Medium"; break;
+        case LLAMA_FTYPE_MOSTLY_Q6_K:      name = LLAMA_FTYPE_PREFIX "Q6_K"; break;
+        case LLAMA_FTYPE_MOSTLY_TQ1_0:     name = LLAMA_FTYPE_PREFIX "TQ1_0 - 1.69 bpw ternary"; break;
+        case LLAMA_FTYPE_MOSTLY_TQ2_0:     name = LLAMA_FTYPE_PREFIX "TQ2_0 - 2.06 bpw ternary"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ2_XXS:   name = LLAMA_FTYPE_PREFIX "IQ2_XXS - 2.0625 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ2_XS:    name = LLAMA_FTYPE_PREFIX "IQ2_XS - 2.3125 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ2_S:     name = LLAMA_FTYPE_PREFIX "IQ2_S - 2.5 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ2_M:     name = LLAMA_FTYPE_PREFIX "IQ2_M - 2.7 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ3_XS:    name = LLAMA_FTYPE_PREFIX "IQ3_XS - 3.3 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ3_XXS:   name = LLAMA_FTYPE_PREFIX "IQ3_XXS - 3.0625 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ1_S:     name = LLAMA_FTYPE_PREFIX "IQ1_S - 1.5625 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ1_M:     name = LLAMA_FTYPE_PREFIX "IQ1_M - 1.75 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ4_NL:    name = LLAMA_FTYPE_PREFIX "IQ4_NL - 4.5 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ4_XS:    name = LLAMA_FTYPE_PREFIX "IQ4_XS - 4.25 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ3_S:     name = LLAMA_FTYPE_PREFIX "IQ3_S - 3.4375 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ3_M:     name = LLAMA_FTYPE_PREFIX "IQ3_S mix - 3.66 bpw"; break;
+        default:                           name = LLAMA_FTYPE_PREFIX "unknown, may not work"; break;
     }
+    return (ftype & LLAMA_FTYPE_GUESSED) ? name : name + guessed_prefix_len;
 }
+
+#undef LLAMA_FTYPE_PREFIX
 
 // return a list of splits for a given path
 // for example, given "<name>-00002-of-00004.gguf", returns list of all 4 splits
@@ -146,7 +151,7 @@ namespace GGUFMeta {
             const enum gguf_type arr_type = gguf_get_arr_type(ctx, k);
             return ArrayInfo {
                 arr_type,
-                size_t(gguf_get_arr_n(ctx, k)),
+                gguf_get_arr_n(ctx, k),
                 arr_type == GGUF_TYPE_STRING ? nullptr : gguf_get_arr_data(ctx, k),
             };
         }
@@ -294,6 +299,8 @@ namespace GGUFMeta {
     }
 
     template bool llama_model_loader::get_arr_n(enum llm_kv kid, uint32_t & result, bool required);
+    template std::enable_if<std::is_integral<uint32_t>::value, bool>::type
+    llama_model_loader::get_arr_n<uint32_t>(const std::string & key, uint32_t & result, bool required);
 
     template<typename T>
     bool llama_model_loader::get_arr(const std::string & key, std::vector<T> & result, bool required) {
@@ -393,6 +400,9 @@ namespace GGUFMeta {
     }
 
     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
+    template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);
+    template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
 
     template<typename T>
     bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {
@@ -445,7 +455,7 @@ namespace GGUFMeta {
         }
 
         if (n > N_MAX) {
-            throw std::runtime_error(format("n > N_MAX: %u > %u for key %s", (uint32_t) n, (uint32_t) N_MAX, key.c_str()));
+            throw std::runtime_error(format("n > N_MAX: %u > %u for key %s", n, (uint32_t) N_MAX, key.c_str()));
         }
 
         if (gguf_get_kv_type(metadata, kid) == GGUF_TYPE_ARRAY) {
@@ -502,10 +512,174 @@ namespace GGUFMeta {
     }
 
     // TODO: this is not very clever - figure out something better
-    template bool llama_model_loader::get_key_or_arr<std::array<int, 4>>(enum llm_kv kid, std::array<int, 4> & result, uint32_t n, bool required);
+    template bool llama_model_loader::get_key_or_arr<std::array<int,      4>>  (enum llm_kv kid, std::array<int,      4>   & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
-    template bool llama_model_loader::get_key_or_arr<std::array<float, 512>>(enum llm_kv kid, std::array<float, 512> & result, uint32_t n, bool required);
+    template bool llama_model_loader::get_key_or_arr<std::array<float,    512>>(enum llm_kv kid, std::array<float,    512> & result, uint32_t n, bool required);
 
+
+// DSpark drafter recipe mapping (alessandrobologna conversion, arch
+// 'deepseek_v4_flash_dspark_draft' aliased to LLM_ARCH_DFLASH in llama-arch.cpp).
+//
+// The drafter GGUF carries only dspark.* metadata (no llama.*/deepseek4.* keys, no
+// tokenizer) and 81 dspark.* tensors. The DSV4 DFlash loader (dflash.cpp) expects
+// factored DSV4 tensor names (blk.N.*, fc, enc.output_norm, ...) and the standard
+// deepseek4-style dflash.* hparams. This function:
+//   - synthesizes the required dflash.* metadata from the dspark.* keys + tensor shapes,
+//   - renames the tensors to the loader-expected names (mechanical prefix rewrite for
+//     the per-layer blk.N.* set, plus a small per-tensor table for the top-level ones),
+//   - declares a no_vocab tokenizer so the vocab loader builds n_vocab dummy tokens
+//     (the drafter shares the target model's vocab; only the size matters for shapes).
+static void llama_model_loader_apply_dspark_mapping(
+        struct gguf_context * ctx,
+        std::map<std::string, llama_model_loader::llama_tensor_weight, llama_model_loader::weight_name_comparer> & weights_map) {
+
+    const auto has_tensor = [&](const char * name) -> const ggml_tensor * {
+        auto it = weights_map.find(name);
+        return it == weights_map.end() ? nullptr : it->second.tensor;
+    };
+
+    const int n_layer_kid = gguf_find_key(ctx, "dspark.layer_count");
+    const uint32_t n_layer = n_layer_kid >= 0 ? gguf_get_val_u32(ctx, n_layer_kid) : 3;
+
+    // derive structural hparams from the drafter's tensor shapes (DeepSeek-V4-Flash layout)
+    const ggml_tensor * t_norm    = has_tensor("dspark.norm.weight");
+    const ggml_tensor * t_q_b     = has_tensor("dspark.0.attn_q_b.weight");
+    const ggml_tensor * t_kv      = has_tensor("dspark.0.attn_kv.weight");
+    const ggml_tensor * t_q_a     = has_tensor("dspark.0.attn_q_a.weight");
+    const ggml_tensor * t_out_a   = has_tensor("dspark.0.attn_output_a.weight");
+    const ggml_tensor * t_hc      = has_tensor("dspark.0.hc_attn_fn.weight");
+    const ggml_tensor * t_gate_ex = has_tensor("dspark.0.ffn_gate_exps.weight");
+    const ggml_tensor * t_shexp   = has_tensor("dspark.0.ffn_gate_shexp.weight");
+    const ggml_tensor * t_markov  = has_tensor("dspark.markov_w1.weight");
+
+    const uint32_t n_embd    = t_norm    ? t_norm->ne[0]    : 4096;
+    const uint32_t kv_dim    = t_kv      ? t_kv->ne[1]      : 512;
+    const uint32_t n_head    = (t_q_b && t_kv) ? t_q_b->ne[1] / t_kv->ne[1] : 64;
+    const uint32_t q_lora    = t_q_a     ? t_q_a->ne[1]     : 1024;
+    const uint32_t o_groups  = (t_out_a && n_head > 0 && kv_dim > 0) ? (n_head*kv_dim)/t_out_a->ne[0] : 8;
+    const uint32_t o_lora    = (t_out_a && o_groups > 0) ? t_out_a->ne[1] / o_groups : 1024;
+    const uint32_t hc_mult   = (t_hc && n_embd > 0) ? t_hc->ne[0] / n_embd : 4;
+    const uint32_t n_ff_exp  = t_gate_ex ? t_gate_ex->ne[1] : 2048;
+    const uint32_t n_expert  = t_gate_ex ? t_gate_ex->ne[2] : 256;
+    const uint32_t n_shared  = (t_shexp && n_ff_exp > 0) ? t_shexp->ne[1] / n_ff_exp : 1;
+    const uint32_t n_vocab   = t_markov ? t_markov->ne[1]  : 129280;
+
+    const auto dspark_u32 = [&](const char * key, uint32_t fallback) {
+        const int kid = gguf_find_key(ctx, key);
+        return kid >= 0 ? gguf_get_val_u32(ctx, kid) : fallback;
+    };
+    const uint32_t block_size = dspark_u32("dspark.block_size", 5);
+
+    const auto add_u32  = [&](const char * key, uint32_t val) { if (gguf_find_key(ctx, key) < 0) gguf_set_val_u32(ctx, key, val); };
+    const auto add_f32  = [&](const char * key, float val)    { if (gguf_find_key(ctx, key) < 0) gguf_set_val_f32(ctx, key, val); };
+    const auto add_bool = [&](const char * key, bool val)     { if (gguf_find_key(ctx, key) < 0) gguf_set_val_bool(ctx, key, val); };
+    const auto add_str  = [&](const char * key, const char * val) { if (gguf_find_key(ctx, key) < 0) gguf_set_val_str(ctx, key, val); };
+    const auto add_arr_i32 = [&](const char * key, const std::vector<int32_t> & vals) {
+        if (gguf_find_key(ctx, key) < 0 && !vals.empty()) gguf_set_arr_data(ctx, key, GGUF_TYPE_INT32, vals.data(), vals.size());
+    };
+    const auto add_arr_f32 = [&](const char * key, const std::vector<float> & vals) {
+        if (gguf_find_key(ctx, key) < 0 && !vals.empty()) gguf_set_arr_data(ctx, key, GGUF_TYPE_FLOAT32, vals.data(), vals.size());
+    };
+
+    // generic hparams required by llama_model_base::load_hparams
+    add_u32("dflash.context_length", 4096);
+    add_u32("dflash.embedding_length", n_embd);
+    add_u32("dflash.block_count", n_layer);
+    add_u32("dflash.feed_forward_length", n_ff_exp);
+    add_u32("dflash.expert_count", n_expert);
+    add_u32("dflash.expert_used_count", 6);
+    // DSV4 DFlash loader hparams (dflash.cpp DSV4 branch) - DeepSeek-V4-Flash constants
+    add_u32("dflash.expert_feed_forward_length", n_ff_exp);
+    add_u32("dflash.expert_shared_count", n_shared);
+    add_f32("dflash.expert_weights_scale", 1.5f);
+    add_bool("dflash.expert_weights_norm", true);
+    add_u32("dflash.expert_gating_func", 4); // LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS
+    add_u32("dflash.attention.head_count", n_head);
+    add_u32("dflash.attention.head_count_kv", 1);
+    add_u32("dflash.attention.key_length", kv_dim);
+    add_u32("dflash.attention.value_length", kv_dim);
+    add_f32("dflash.attention.layer_norm_rms_epsilon", 1e-6f);
+    add_u32("dflash.attention.q_lora_rank", q_lora);
+    add_u32("dflash.attention.sliding_window", 128);
+    add_u32("dflash.attention.output_group_count", o_groups);
+    add_u32("dflash.attention.output_lora_rank", o_lora);
+    add_arr_i32("dflash.attention.compress_ratios", std::vector<int32_t>(n_layer, 0));
+    add_u32("dflash.hyper_connection.count", hc_mult);
+    add_f32("dflash.hyper_connection.epsilon", 1e-6f);
+    add_u32("dflash.hyper_connection.sinkhorn_iterations", 20);
+    add_u32("dflash.rope.dimension_count", 64);
+    add_f32("dflash.rope.freq_base", 10000.0f);
+    add_str("dflash.rope.scaling.type", "yarn");
+    add_f32("dflash.rope.scaling.factor", 16.0f);
+    add_u32("dflash.rope.scaling.original_context_length", 65536);
+    add_f32("dflash.rope.scaling.yarn_beta_fast", 32.0f);
+    add_f32("dflash.rope.scaling.yarn_beta_slow", 1.0f);
+    add_arr_f32("dflash.swiglu_clamp_exp", std::vector<float>(n_layer, 10.0f));
+    // recipe keys the spec/draft path reads directly
+    add_u32("dflash.block_size", block_size);
+    add_u32("dflash.vocab_size", n_vocab);
+    // tokenizer: the drafter carries no vocab; no_vocab makes the vocab loader build
+    // n_vocab dummy tokens (shape source for the markov head) - the draft shares the
+    // target model's vocab at runtime
+    add_str("tokenizer.ggml.model", "no_vocab");
+    {
+        std::vector<int32_t> ids;
+        const int kid = gguf_find_key(ctx, "dspark.target_layer_ids");
+        if (kid >= 0 && gguf_get_arr_n(ctx, kid) > 0) {
+            const int32_t * data = (const int32_t *) gguf_get_arr_data(ctx, kid);
+            ids.assign(data, data + gguf_get_arr_n(ctx, kid));
+        }
+        if (ids.size() != n_layer) {
+            ids.clear();
+            for (uint32_t i = 0; i < n_layer; ++i) {
+                ids.push_back(i);
+            }
+        }
+        add_arr_i32("dflash.target_layers", ids);
+    }
+
+    // tensor name remapping: dspark.* -> loader-expected names
+    // note: the ggml tensor names are renamed as well - get_mapping_range() and the
+    // mmap buffer path look tensors up by name, so keeping the dspark.* names would
+    // leave the weights without a buffer
+    std::map<std::string, llama_model_loader::llama_tensor_weight, llama_model_loader::weight_name_comparer> remapped;
+    for (auto & it : weights_map) {
+        const std::string & name = it.first;
+        std::string new_name;
+        if (name.rfind("dspark.", 0) == 0) {
+            const std::string rest = name.substr(7); // after "dspark."
+            if (rest.size() >= 2 && rest[0] >= '0' && rest[0] <= '9' && rest[1] == '.') {
+                // mechanical prefix rewrite for per-layer tensors: dspark.N.* -> blk.N.*
+                new_name = "blk." + rest;
+            } else {
+                static const std::map<std::string, std::string> table = {
+                    { "dspark.main_proj.weight",        "fc.weight" },
+                    { "dspark.main_norm.weight",        "enc.output_norm.weight" },
+                    { "dspark.norm.weight",             "output_norm.weight" },
+                    { "dspark.markov_w1.weight",        "markov_w1.weight" },
+                    { "dspark.markov_w2.weight",        "markov_w2.weight" },
+                    { "dspark.confidence_head.weight",  "conf_proj.weight" },
+                    { "dspark.hc_head_fn.weight",       "output_hc_fn.weight" },
+                    { "dspark.hc_head_base.weight",     "output_hc_base.weight" },
+                    { "dspark.hc_head_scale.weight",    "output_hc_scale.weight" },
+                };
+                auto it2 = table.find(name);
+                if (it2 != table.end()) {
+                    new_name = it2->second;
+                }
+            }
+        }
+        if (new_name.empty()) {
+            new_name = name;
+        }
+        ggml_set_name(it.second.tensor, new_name.c_str());
+        remapped.emplace(new_name, std::move(it.second));
+    }
+    weights_map = std::move(remapped);
+
+    LLAMA_LOG_INFO("%s: dspark drafter mapping applied: arch alias -> dflash, %zu tensors remapped, %u layers\n",
+            __func__, weights_map.size(), n_layer);
+}
 
 llama_model_loader::llama_model_loader(
         struct gguf_context * meta,
@@ -514,10 +688,10 @@ llama_model_loader::llama_model_loader(
         const std::string & fname,
         std::vector<std::string> & splits,
         FILE * file,
-        bool use_mmap,
-        bool use_direct_io,
+        llama_load_mode load_mode,
         bool check_tensors,
         bool no_alloc,
+        bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
@@ -533,6 +707,9 @@ llama_model_loader::llama_model_loader(
     }
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
+
+    this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+    this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
 
     if (!fname.empty()) {
         // Load the main GGUF
@@ -553,20 +730,6 @@ llama_model_loader::llama_model_loader(
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
         contexts.emplace_back(ctx);
-
-        if (use_mmap && use_direct_io) {
-            if (files.back()->has_direct_io()) {
-                LLAMA_LOG_WARN("%s: direct I/O is enabled, disabling mmap\n", __func__);
-                use_mmap = false;
-            } else {
-                LLAMA_LOG_WARN("%s: direct I/O is not available, using mmap\n", __func__);
-                use_direct_io = false;
-
-                // reopen file using std::fopen for mmap
-                files.pop_back();
-                files.emplace_back(new llama_file(fname.c_str(), "rb", false));
-            }
-        }
 
         // Save tensors data offset of the main file.
         // For subsidiary files, `meta` tensor data offset must not be used,
@@ -696,6 +859,21 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    // DSpark drafter recipe: any 'dspark.'-prefixed tensor marks the alessandrobologna
+    // conversion - synthesize the loader-required metadata and remap tensor names
+    if (!weights_map.empty()) {
+        bool is_dspark = false;
+        for (const auto & it : weights_map) {
+            if (it.first.rfind("dspark.", 0) == 0) {
+                is_dspark = true;
+                break;
+            }
+        }
+        if (is_dspark) {
+            llama_model_loader_apply_dspark_mapping(metadata, weights_map);
+        }
+    }
+
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
@@ -760,6 +938,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
+            case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
@@ -807,15 +986,14 @@ llama_model_loader::llama_model_loader(
         }
     }
 
-    if (!llama_mmap::SUPPORTED) {
+    if (this->use_mmap && !llama_mmap::SUPPORTED) {
         LLAMA_LOG_WARN("%s: mmap is not supported on this platform\n", __func__);
-        use_mmap = false;
+        this->use_mmap = false;
     }
 
-    this->use_mmap = use_mmap;
-    this->use_direct_io = use_direct_io;
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
+    this->load_mtp = load_mtp;
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -1050,10 +1228,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (it == ctx_map.end()) {
             // one ggml context per buffer type
             int max_n_tensors = n_tensors;
-            max_n_tensors += 1;                 // duplicated output tensor
-            max_n_tensors += hparams.n_layer*2; // duplicated rope freq tensors
+            max_n_tensors += 1;                   // duplicated output tensor
+            max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
             if (files.empty()) {
-                max_n_tensors += hparams.n_layer*256; // this should be well above what any model actually uses
+                max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
             }
             const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
 
@@ -1688,12 +1866,12 @@ bool llama_model_loader::load_all_data(
 }
 
 std::string llama_model_loader::ftype_name() const {
-    return llama_model_ftype_name(ftype);
+    return llama_ftype_name(ftype);
 }
 
 void llama_model_loader::print_info() const {
     LLAMA_LOG_INFO("%s: file format = %s\n", __func__, llama_file_version_name(fver));
-    LLAMA_LOG_INFO("%s: file type   = %s\n", __func__, llama_model_ftype_name(ftype).c_str());
+    LLAMA_LOG_INFO("%s: file type   = %s\n", __func__, llama_ftype_name(ftype));
     if (n_bytes < GiB) {
         LLAMA_LOG_INFO("%s: file size   = %.2f MiB (%.2f BPW) \n", __func__, n_bytes/1024.0/1024.0,        n_bytes*8.0/n_elements);
     } else {
