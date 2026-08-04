@@ -4967,34 +4967,28 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (src0_type == GGML_TYPE_I32 && src1_type == GGML_TYPE_I32) {
                     return true;
                 }
-                if (src0_type == GGML_TYPE_TBQ3_0 && src1_type == GGML_TYPE_F32) {
+                if (src0_type == GGML_TYPE_TBQ3_0 && src1_type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) {
                     return true;
                 }
-                if (src0_type == GGML_TYPE_TBQ4_0 && src1_type == GGML_TYPE_F32) {
+                if (src0_type == GGML_TYPE_TBQ4_0 && src1_type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) {
                     return true;
                 }
-                if (src0_type == GGML_TYPE_PLANAR3_0 && src1_type == GGML_TYPE_F32) {
+                if (src0_type == GGML_TYPE_PLANAR3_0 && src1_type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) {
                     return true;
                 }
-                if (src0_type == GGML_TYPE_ISO3_0 && src1_type == GGML_TYPE_F32) {
+                if (src0_type == GGML_TYPE_ISO3_0 && src1_type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) {
                     return true;
                 }
-                if (src0_type == GGML_TYPE_PLANAR4_0 && src1_type == GGML_TYPE_F32) {
+                if (src0_type == GGML_TYPE_PLANAR4_0 && src1_type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) {
                     return true;
                 }
-                if (src0_type == GGML_TYPE_ISO4_0 && src1_type == GGML_TYPE_F32) {
-                    return true;
-                }
-                if (src0_type == GGML_TYPE_PLANAR3_0 && src1_type == GGML_TYPE_F16) {
-                    return true;
-                }
-                if (src0_type == GGML_TYPE_ISO3_0 && src1_type == GGML_TYPE_F16) {
-                    return true;
-                }
-                if (src0_type == GGML_TYPE_PLANAR4_0 && src1_type == GGML_TYPE_F16) {
-                    return true;
-                }
-                if (src0_type == GGML_TYPE_ISO4_0 && src1_type == GGML_TYPE_F16) {
+                if (src0_type == GGML_TYPE_ISO4_0 && src1_type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) {
                     return true;
                 }
                 if (src0_type == src1_type && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) {
