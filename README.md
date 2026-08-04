@@ -86,19 +86,75 @@ Context sizing: 4K → 11.61 t/s, 32K → 11.39 t/s, 256K → 10.29 t/s, 512K �
 
 ### MTP mode (Qwen3.6 family)
 
+The synced baseline carries upstream speculative decoding (`--spec-type draft-mtp`).
+The fork-native MTP (`--spec-type mtp`) is being re-ported as a side-by-side
+feature-flagged alternative (A/B comparison pending — see "Feature Flags"):
+
 ```bash
 ./build-mtp/bin/llama-server \
   -m your-qwen3.6-mtp.gguf \
-  --spec-type mtp --spec-draft-n-max 3 \
+  --spec-type draft-mtp --spec-draft-n-max 3 \
   -ctk tbq4_0 -ctv tbq4_0 -c 262144 -ngl 99 \
   --flash-attn on --mlock -t 8 -ub 32 -np 1 --no-warmup
 ```
 
+## Feature Flags & Configuration
+
+Everything below is selectable at runtime or build time; nothing is hardcoded.
+
+### Runtime: speculative decoding (`--spec-type`)
+
+| Value | Meaning | Status |
+|-------|---------|--------|
+| `draft-mtp` | Upstream MTP (PR #22673 lineage; chain heads, gemma4 mem-shared, DSV4 MTP) | ✅ in sync baseline |
+| `draft-eagle3` | EAGLE3 draft model (qwen3.5/3.6 sidecar, auto-downloaded) | ✅ in sync baseline |
+| `draft-dflash` | DFlash drafting (deepseek2-v2 lineage) | ✅ in sync baseline |
+| `draft-dspark` | DSpark drafting (deepseek-v4) | ✅ in sync baseline |
+| `draft-simple` / `ngram-*` | Upstream classic drafting | ✅ in sync baseline |
+| `mtp` | **Fork-native MTP** (KV-mirror via `llama_set_mtp`, stochastic draft sampler, `--spec-adapt`, `--parallel 1` only) | ⏳ re-port in progress (Phase 3); not yet wired |
+
+### Runtime: KV cache types (`-ctk` / `-ctv`)
+
+| Type | Bits | Notes |
+|------|------|-------|
+| `tbq4_0` | 4.25 | TurboQuant, FWHT rotated, fused FA dequant — flagship |
+| `tbq3_0` | 3.0625 | 3-bit TurboQuant, ~24% smaller KV, fused FA |
+| `planar3_0` / `iso3_0` | 3.0 | RotorQuant (Givens/quaternion rotations) |
+| `planar4_0` / `iso4_0` | 4.0 | RotorQuant (Givens/quaternion rotations) |
+| `q4_0` / `q8_0` / `f16` | — | Upstream stock types (always available) |
+
+Requires `--flash-attn on`. `planar*_0`/`iso*_0` require the build flag `GGML_CUDA_FA_ALL_QUANTS=ON` (below).
+
+### Runtime: environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `DSV4_CTK_COMP=<type>` | DSV4 only: per-cache K quant override (e.g. `tbq3_0` for mixed TBQ4+TBQ3 csa/hca sites) |
+| `LLAMA_KV_PAD_MIN=<n>` | KV pad floor for graph re-capture tuning (fork patch, re-port in progress) |
+
+### Runtime: model hot-swap (in-process, no restart)
+
+`--models-preset <ini>` + `POST /models/load {"model": "<key>"}` + lazy swap via the
+`model` field on `/v1/chat/completions`, `/v1/responses`, `/v1/messages`. Registry is
+an INI with per-model sections (spec type, KV type, ctx, aliases...). See the
+model-swap PR (feature/model-hot-swap) for details; `swap-model.sh` is the CLI helper.
+
+### Build time
+
+| Flag | Effect |
+|------|--------|
+| `GGML_CUDA_FA=ON` | Flash attention (required for all quantized-KV FA paths) |
+| `GGML_CUDA_FA_ALL_QUANTS=ON` | Enables the full RotorQuant set (`planar3_0`/`iso3_0`/`planar4_0`/`iso4_0`) in the FA path |
+| `CMAKE_CUDA_ARCHITECTURES=89` | RTX 4090 (Ada sm_89); this fork is NVIDIA-only |
+| `GGML_CUDA_COMPRESSION_MODE=size` | Smaller CUDA binaries (optional) |
+
 ---
 
-## Upstream MTP Status — Why We Keep Our Implementation
+## Upstream MTP Status — Two Implementations, Feature-Flagged
 
-As of May 16, 2026, upstream `ggml-org/llama.cpp` merged official MTP support via [PR #22673](https://github.com/ggml-org/llama.cpp/pull/22673) (`255582687`), which uses `--spec-type draft-mtp`. **We are NOT adopting it.** Our custom MTP (`--spec-type mtp`) predates the merge and beats upstream in every measured metric — head-to-head on RTX 4090 24GB with Qwen3.6-27B-Heretic-v2-MTP Q4_K_M:
+Upstream `ggml-org/llama.cpp` merged official MTP support via [PR #22673](https://github.com/ggml-org/llama.cpp/pull/22673) (`255582687`), which uses `--spec-type draft-mtp`. The Aug 2026 sync absorbed it (plus EAGLE3/DFlash/DSpark speculative types). The fork's custom MTP (`--spec-type mtp`) is being re-ported on top and will be **feature-flagged side-by-side** with `draft-mtp` so both can be A/B tested on identical hardware — see "Feature Flags" below.
+
+Historical head-to-head (May 2026, RTX 4090 24GB, Qwen3.6-27B-Heretic-v2-MTP Q4_K_M; note: upstream MTP was measured on a base without our TBQ4 KV/FA stack):
 
 | Metric | Upstream MTP | Our Fork | Delta |
 |--------|:-----------:|:--------:|:-----:|
@@ -110,7 +166,7 @@ As of May 16, 2026, upstream `ggml-org/llama.cpp` merged official MTP support vi
 | **Tensor sharing** | ❌ 682 MiB duplicated | ✅ `link_shared_tensors()` | Saved 682 MiB |
 | **RotorQuant** | ❌ | ✅ planar3/iso3/planar4/iso4 | 3-4 bit KV cache options |
 
-Future upstream syncs will pull non-MTP improvements (tokenizer fixes, server patches); the TBQ4 + RotorQuant + tensor sharing + MTP stack stays ours.
+The TBQ4 + RotorQuant + tensor sharing KV/FA stack is fork-owned and orthogonal to the MTP choice — it works with either implementation.
 
 ## Results (Qwen3.6-27B-Heretic-v2-MTP Q4_K_M, RTX 4090 24GB)
 
