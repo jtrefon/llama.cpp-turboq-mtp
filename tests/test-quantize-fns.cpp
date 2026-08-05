@@ -173,7 +173,7 @@ static bool test_tbq3_norm_scaling() {
     dequantize_row_tbq3_0(&block, y.data(), QK_TBQ3);
 
     const float d = ggml_fp16_to_fp32(block.d);
-    if (!(d > 0.0f) || !std::isfinite(d)) {
+    if (!(d > 0.0f) || !isfinite(d)) {
         return false;
     }
 
