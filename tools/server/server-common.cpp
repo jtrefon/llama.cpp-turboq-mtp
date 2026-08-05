@@ -1105,9 +1105,12 @@ json oaicompat_chat_params_parse(
     // so n_past is large, checkpoints can be restored, and only the delta
     // (new tokens) gets processed instead of a full prefill reload.
     {
-        const size_t margin = std::max<int>(
+        // clamp the margin so it can never consume the whole context: a small-ctx
+        // server (e.g. -c 8192) would otherwise get budget 0 and trim everything
+        const size_t desired_margin = std::max<int>(
             opt.reasoning_budget + 4096,   // reasoning budget + tool calls/output
             8192);                          // minimum safe margin
+        const size_t margin = std::min(desired_margin, std::max<size_t>(1, opt.n_ctx) / 2);
         const size_t budget = std::max<size_t>(1, opt.n_ctx) - margin;
 
         auto estimate_msg_tokens = [](const common_chat_msg & msg) -> size_t {
@@ -1126,6 +1129,7 @@ json oaicompat_chat_params_parse(
         for (const auto & msg : inputs.messages) {
             total += estimate_msg_tokens(msg);
         }
+        SRV_INF("trim debug: n_ctx=%d reasoning_budget=%d margin=%zu budget=%zu total=%zu\n", opt.n_ctx, opt.reasoning_budget, margin, budget, total);
 
         if (total > budget) {
             // Find system prompt (usually the first message, role="system")
