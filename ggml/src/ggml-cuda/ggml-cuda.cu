@@ -5022,7 +5022,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
-                const int32_t dim = op->op_params[0];
                 return src0_type == src1_type &&
                        src0_type == op->type &&
                        (
