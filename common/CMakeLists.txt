@@ -127,6 +127,21 @@ set_target_properties(${TARGET} PROPERTIES
 )
 
 target_include_directories(${TARGET} PUBLIC . ../vendor)
+if (GGML_CUDA)
+    # fork: async checkpoint capture (common.cpp) uses the CUDA runtime API
+    if (NOT TARGET CUDA::cudart)
+        find_package(CUDAToolkit QUIET)
+    endif()
+    if (TARGET CUDA::cudart)
+        get_target_property(CUDA_RT_INC CUDA::cudart INTERFACE_INCLUDE_DIRECTORIES)
+        target_include_directories(${TARGET} PRIVATE ${CUDA_RT_INC})
+    elseif (CMAKE_CUDA_COMPILER)
+        get_filename_component(CUDA_BIN_DIR ${CMAKE_CUDA_COMPILER} DIRECTORY)
+        get_filename_component(CUDA_ROOT ${CUDA_BIN_DIR} DIRECTORY)
+        target_include_directories(${TARGET} PRIVATE ${CUDA_ROOT}/include)
+    endif()
+endif()
+
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (LLAMA_SUBPROCESS)
