@@ -1,16 +1,16 @@
 #!/bin/bash
-# Swap the in-process model of the llama-turboq server (in-process, no restart).
+# Load a model on the llama-turboq router server (no restart needed).
 #
 # Usage:
 #   swap-model.sh <model-name> [port]
 #
 # Model names are the sections in /home/jack/llm/llama-turboq/models.ini,
-# e.g. qwopus-27b, qwen35-dense, qwen35-pi-reasoning, qwen35-moe,
-# gemma4-12b-q4, gemma4-12b-q8.
+# e.g. Qwopus3.6-27B-v2-MTP, Qwen3.6-27B-MTP-pi-reasoning, Qwen3.6-27B,
+# Qwen3.6-35B-A3B-UD, Ornith-1.0-9B, Gemma-4-12B.
 #
-# The POST /models/load call is synchronous: it returns once the new model is
-# loaded (or fails). This script then polls GET /models until the requested
-# model reports status=loaded.
+# POST /models/load is synchronous: the router spawns/stops the child server
+# and returns {"success": true} once the model is loaded (or an error). This
+# script then polls GET /models until the requested model reports loaded.
 
 set -euo pipefail
 
@@ -18,7 +18,7 @@ NAME="${1:?usage: swap-model.sh <model-name> [port]}"
 PORT="${2:-8081}"
 BASE="http://127.0.0.1:$PORT"
 
-RESP=$(curl -s -m 600 -X POST "$BASE/models/load" \
+RESP=$(curl -s -m 900 -X POST "$BASE/models/load" \
     -H 'Content-Type: application/json' \
     -d "{\"model\":\"$NAME\"}")
 
@@ -29,9 +29,8 @@ try:
 except Exception as e:
     print("parse-error")
     sys.exit(0)
-# success payload: {"status": "loaded", "error": ""}
-# failure payload: {"error": {"status": "error", ...}}
-if d.get("status") == "loaded":
+# router success payload: {"success": true}
+if d.get("success"):
     print("loaded")
 else:
     print("error")
@@ -43,9 +42,9 @@ if [ "$STATUS" = "error" ]; then
     exit 1
 fi
 
-# poll until the requested model reports loaded (should be immediate since the
-# POST is synchronous; kept for robustness / use with the web UI)
-for _ in $(seq 1 30); do
+# poll until the requested model reports loaded (the router load is
+# synchronous, so this should be immediate; kept for robustness)
+for _ in $(seq 1 60); do
     LOADED=$(curl -s -m 10 "$BASE/models" | python3 -c "
 import json, sys
 try:
@@ -54,7 +53,10 @@ except Exception:
     print('no')
     sys.exit(0)
 for m in d.get('data', []):
-    if m.get('id') == '$NAME' and m.get('status') == 'loaded':
+    st = m.get('status')
+    if isinstance(st, dict):
+        st = st.get('value')
+    if m.get('id') == '$NAME' and st == 'loaded':
         print('yes')
         sys.exit(0)
 print('no')
@@ -63,8 +65,8 @@ print('no')
         echo "model '$NAME' is now loaded"
         exit 0
     fi
-    sleep 1
+    sleep 2
 done
 
-echo "model '$NAME': loaded but status not confirmed via /models after 30s"
+echo "model '$NAME': loaded but status not confirmed via /models after 120s"
 exit 1

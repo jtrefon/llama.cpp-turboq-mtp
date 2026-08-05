@@ -168,14 +168,18 @@ Historical head-to-head (May 2026, RTX 4090 24GB, Qwen3.6-27B + MTP Q4_K_M; note
 
 The TBQ4 + RotorQuant + tensor sharing KV/FA stack is fork-owned and orthogonal to the MTP choice — it works with either implementation.
 
-## Supported Models (Qwen3.6 family)
+## Supported Models
 
-| Model | Type | Variant | Notes |
-|-------|------|---------|-------|
-| qwen3.6-27b | dense | base | full attention, no MTP |
-| qwen3.6-27b + MTP | dense | pi-reasoning | trained MTP head, pi-style reasoning |
-| qwopus3.6-27b-v2 + MTP | dense | qwopus | 15 native MTP heads (Qwopus v2) |
-| qwen3.6-35b-a3b | MoE | base | 35B total / 3B active, unsloth dynamic quants |
+| Model (registry name) | Type | Notes |
+|-------|------|-------|
+| Qwopus3.6-27B-v2-MTP | dense | production model, 15 native MTP heads, TBQ4 KV |
+| Qwen3.6-27B-MTP-pi-reasoning | dense | pi-reasoning variant, trained MTP head |
+| Qwen3.6-27B-MTP | dense | Unsloth GGUF with MTP head trained in-file |
+| Qwen3.6-27B | dense | stock dense base (Qwen/Qwen3.6-27B), no MTP |
+| Qwen3.6-35B-A3B-UD | MoE | 35B total / 3B active, unsloth dynamic quants |
+| Ornith-1.0-35B-UD | MoE | agentic coding 35B (GGUF metadata mislabels it 9B) |
+| Ornith-1.0-9B | dense | agentic coding 9B (SWE-bench 69.4) |
+| Gemma-4-12B / Gemma-4-12B-Q8 | dense | 12B instruct, Q4_K_M / Q8_0, gemma4-assistant sidecar draft |
 
 MTP variants require `--spec-type draft-mtp --spec-draft-n-max 3` (upstream MTP).
 The fork-native `--spec-type mtp` is not wired in the current baseline (re-port in
