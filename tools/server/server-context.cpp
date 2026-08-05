@@ -12,6 +12,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
+#include "preset.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "mtmd.h"
@@ -911,9 +912,38 @@ public:
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
-    server_context_impl() {
+    // model swap registry, populated from params_base.models_preset (INI file) in init()
+    common_preset_context ctx_preset;
+    common_presets model_presets; // keyed by preset section name
+    common_preset global_preset;  // [global] section, cascaded into every preset
+
+    // invoked (on the main loop thread) after a model swap completes
+    // used to refresh server_routes::meta
+    std::function<void()> callback_on_model_swapped;
+
+    // resolve a model name (preset section key or one of its LLAMA_ARG_ALIAS
+    // entries) to the preset key; returns "" if not found
+    std::string resolve_preset_key(const std::string & name) const {
+        if (model_presets.count(name)) {
+            return name;
+        }
+        std::string aliases;
+        for (const auto & [key, preset] : model_presets) {
+            if (preset.get_option("LLAMA_ARG_ALIAS", aliases)) {
+                for (const auto & alias : string_split<std::string>(aliases, ',')) {
+                    if (alias == name) {
+                        return key;
+                    }
+                }
+            }
+        }
+        return "";
+    }
+
+    server_context_impl() : ctx_preset(LLAMA_EXAMPLE_SERVER) {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
     }
+
 
     ~server_context_impl() {
         if (!sleeping) {
@@ -928,6 +958,15 @@ private:
     // use server_context methods instead
 
     common_params params_base;
+
+    // pristine CLI/server params captured before the first model load;
+    // used as the base for applying preset options during a model swap
+    common_params params_original;
+    bool params_original_captured = false;
+
+    // true while a model swap is in progress: load_model() must skip init()
+    // (queue wiring is already in place) and refresh chat params separately
+    bool is_swapping = false;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -979,19 +1018,33 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // tear down speculative decoding before releasing the target context:
+        // the speculative state references ctx_tgt (and the fork MTP state also
+        // referenced ctx_mtp), so ctx_tgt must still be alive at this point
         spec.reset();
         spec_init.reset();
-
         ctx_dft   = nullptr;
         model_dft = nullptr;
+
+        // multimodal projector references model_tgt, free it first
+        mtmd_free(mctx);
+        mctx = nullptr;
 
         llama_init.reset();
 
         ctx_tgt = nullptr;
         model_tgt = nullptr;
+    }
 
-        mtmd_free(mctx);
-        mctx = nullptr;
+    void slot_save_and_clear(server_slot & slot) {
+        if (slot.prompt.n_tokens() == 0) {
+            return;
+        }
+        SLT_INF(slot, "%s", "saving idle slot to prompt cache\n");
+        SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
+        slot.prompt_save(*prompt_cache);
+        slot.prompt_clear();
+        prompt_cache->update();
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1047,7 +1100,17 @@ private:
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
 
-        const bool is_resume = sleeping;
+        const bool is_resume = sleeping || is_swapping;
+
+        if (!params_original_captured) {
+            params_original     = params;
+            params_original_captured = true;
+        }
+
+        if (!params_original_captured) {
+            params_original     = params;
+            params_original_captured = true;
+        }
 
         params_base = params;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
@@ -1078,51 +1141,6 @@ private:
 
         SRV_INF("loading model '%s'\n", params.model.get_name().c_str());
         SRV_TRC("local path '%s'\n", params.model.path.c_str());
-
-        std::string & mmproj_path = params_base.mmproj.path;
-        mtmd_context_params mparams = mtmd_context_params_default();
-        if (has_mmproj) {
-            mparams.use_gpu          = params_base.mmproj_use_gpu;
-            mparams.print_timings    = false;
-            mparams.n_threads        = params_base.cpuparams.n_threads;
-            mparams.flash_attn_type  = params_base.flash_attn_type;
-            mparams.warmup           = params_base.warmup;
-            mparams.image_min_tokens = params_base.image_min_tokens;
-            mparams.image_max_tokens = params_base.image_max_tokens;
-            mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
-            mparams.media_marker     = get_media_marker();
-            // progress callback
-            mparams.progress_callback           = load_progress_callback;
-            mparams.progress_callback_user_data = &load_progress_mmproj;
-        }
-
-        // optionally get the memory usage of mmproj
-        if (has_mmproj && params_base.fit_params) {
-            int64_t t_start = ggml_time_us();
-            auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
-            int64_t t_elapsed = ggml_time_us() - t_start;
-            if (!mmproj_mem.empty()) {
-                size_t total = 0;
-                for (auto & [dev, size] : mmproj_mem) {
-                    total += size;
-                }
-                SRV_TRC("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB (took %.2f ms)\n", total / (1024.0 * 1024.0), t_elapsed / 1000.0);
-                GGML_ASSERT(!params_base.fit_params_target.empty());
-                for (auto & [dev, size] : mmproj_mem) {
-                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                        if (ggml_backend_dev_get(i) == dev) {
-                            if (i < params_base.fit_params_target.size()) {
-                                SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
-                                params_base.fit_params_target[i] += size;
-                            }
-                            break;
-                        }
-                    }
-                }
-            } else {
-                SRV_ERR("%s", "[mtmd] failed to get memory usage of mmproj\n");
-            }
-        }
 
         // optionally reserve VRAM for the draft / MTP context before fitting the target model
         if (params_base.fit_params) {
@@ -1187,6 +1205,10 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // free the previous init result (if any) before loading the new model,
+        // so a failed load's partially-allocated state cannot block a retry
+        llama_init.reset();
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -1249,6 +1271,18 @@ private:
             if (!is_resume) {
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
+
+            const std::string mmproj_path = params_base.mmproj.path;
+            mtmd_context_params mparams = mtmd_context_params_default();
+            mparams.use_gpu          = params_base.mmproj_use_gpu;
+            mparams.print_timings    = false;
+            mparams.n_threads        = params_base.cpuparams.n_threads;
+            mparams.flash_attn_type  = params_base.flash_attn_type;
+            mparams.warmup           = params_base.warmup;
+            mparams.image_min_tokens = params_base.image_min_tokens;
+            mparams.image_max_tokens = params_base.image_max_tokens;
+            mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
+            mparams.media_marker     = get_media_marker();
 
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
             if (mctx == nullptr) {
@@ -1458,6 +1492,20 @@ private:
 
         metrics.init();
 
+        // load the model swap registry from the preset INI file (if any)
+        if (!params_base.models_preset.empty()) {
+            try {
+                model_presets = ctx_preset.load_from_ini(params_base.models_preset, global_preset);
+                SRV_INF("loaded %zu model presets from '%s'\n", model_presets.size(), params_base.models_preset.c_str());
+                // cascade: the [*] global preset is the base, each section's own
+                // options take precedence over it
+                model_presets = ctx_preset.cascade(global_preset, model_presets);
+            } catch (const std::exception & e) {
+                SRV_ERR("failed to load model presets from '%s': %s\n", params_base.models_preset.c_str(), e.what());
+                return false;
+            }
+        }
+
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {
                 SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
@@ -1488,59 +1536,66 @@ private:
         }
 
         // populate chat template params
+        if (!refresh_chat_params()) {
+            return false;
+        }
+
+        return true;
+    }
+
+    // (re-)build chat_params from the currently loaded model.
+    // called once in init(), and again after a model swap (the chat template
+    // is model-specific and must be refreshed when swapping architectures)
+    bool refresh_chat_params() {
+        common_chat_templates_ptr chat_templates;
+
+        try {
+            chat_templates = common_chat_templates_init(model_tgt, params_base.chat_template);
+
+            LOG_INF("%s: chat template, example_format: '%s'\n", __func__,
+                common_chat_format_example(chat_templates.get(), params_base.use_jinja, params_base.default_template_kwargs).c_str());
+
+        } catch (const std::exception & e) {
+            SRV_ERR("%s: chat template parsing error: %s\n", __func__, e.what());
+            SRV_ERR("%s: please consider disabling jinja via --no-jinja, or use a custom chat template via --chat-template\n", __func__);
+            SRV_ERR("%s: for example: --no-jinja --chat-template chatml\n", __func__);
+            return false;
+        }
+
+        // thinking is enabled if:
+        // 1. It's not explicitly disabled via --reasoning off
+        // 2. The chat template supports it
+        const bool template_supports_thinking = params_base.use_jinja && common_chat_templates_support_enable_thinking(chat_templates.get());
+        const bool enable_thinking = params_base.enable_reasoning != 0 && template_supports_thinking;
+        SRV_INF("%s: chat template, thinking = %d\n", __func__, enable_thinking);
+
+        chat_params = {
+            /* use_jinja             */ params_base.use_jinja,
+            /* prefill_assistant     */ params_base.prefill_assistant,
+            /* reasoning_format      */ params_base.reasoning_format,
+            /* chat_template_kwargs  */ params_base.default_template_kwargs,
+            /* tmpls                 */ std::move(chat_templates),
+            /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
+            /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
+            /* allow_video           */ mctx ? mtmd_helper_support_video(mctx) : false,
+            /* enable_thinking       */ enable_thinking,
+            /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
+            /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
+            /* media_path            */ params_base.media_path,
+            /* force_pure_content    */ params_base.force_pure_content_parser,
+            /* n_ctx                 */ params_base.n_ctx
+        };
+
         {
-            common_chat_templates_ptr chat_templates;
-            bool enable_thinking = false;
-
-            try {
-                chat_templates = common_chat_templates_init(model_tgt, params_base.chat_template);
-
-                SRV_TRC("%s: chat template, example_format: '%s'\n", __func__,
-                    common_chat_format_example(chat_templates.get(), params_base.use_jinja, params_base.default_template_kwargs).c_str());
-
-                // thinking is enabled if:
-                // 1. It's not explicitly disabled via --reasoning off
-                // 2. The chat template supports it
-                const bool template_supports_thinking = params_base.use_jinja && common_chat_templates_support_enable_thinking(chat_templates.get());
-                enable_thinking = params_base.enable_reasoning != 0 && template_supports_thinking;
-                SRV_TRC("%s: chat template, thinking = %d\n", __func__, enable_thinking);
-            } catch (const std::exception & e) {
-                SRV_ERR("%s: chat template parsing error: %s\n", __func__, e.what());
-                SRV_ERR("%s: please consider disabling jinja via --no-jinja, or use a custom chat template via --chat-template\n", __func__);
-                SRV_ERR("%s: for example: --no-jinja --chat-template chatml\n", __func__);
-                return false;
+            auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
+            auto it = params_base.default_template_kwargs.find("preserve_reasoning");
+            bool supported = caps.at("supports_preserve_reasoning");
+            bool enabled = it != params_base.default_template_kwargs.end();
+            if (supported && !enabled) {
+                SRV_INF("%s", "chat template supports preserving reasoning, consider enabling it via --reasoning-preserve\n");
             }
-
-            // IMPORTANT: chat_params is reused across sleeping / resuming states,
-            //            never store llama_context/llama_model pointers in chat_params,
-            //            as they may be invalidated after sleeping
-            chat_params = {
-                /* use_jinja             */ params_base.use_jinja,
-                /* prefill_assistant     */ params_base.prefill_assistant,
-                /* reasoning_format      */ params_base.reasoning_format,
-                /* chat_template_kwargs  */ params_base.default_template_kwargs,
-                /* tmpls                 */ std::move(chat_templates),
-                /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
-                /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
-                /* allow_video           */ mctx ? mtmd_helper_support_video(mctx) : false,
-                /* enable_thinking       */ enable_thinking,
-                /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
-                /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
-                /* media_path            */ params_base.media_path,
-                /* force_pure_content    */ params_base.force_pure_content_parser
-            };
-
-            {
-                auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
-                auto it = params_base.default_template_kwargs.find("preserve_reasoning");
-                bool supported = caps.at("supports_preserve_reasoning");
-                bool enabled = it != params_base.default_template_kwargs.end();
-                if (supported && !enabled) {
-                    SRV_INF("%s", "chat template supports preserving reasoning, consider enabling it via --reasoning-preserve\n");
-                }
-                if (!supported && enabled) {
-                    SRV_WRN("%s", "chat template does NOT support preserving reasoning, --reasoning-preserve has no effect\n");
-                }
+            if (!supported && enabled) {
+                SRV_WRN("%s", "chat template does NOT support preserving reasoning, --reasoning-preserve has no effect\n");
             }
         }
 
@@ -2713,6 +2768,104 @@ private:
                     params_base.lora_adapters = new_loras;
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_MODEL_SWAP:
+                {
+                    const std::string target = resolve_preset_key(task.model_name);
+
+                    // wait for in-flight generations to finish before tearing down the model
+                    bool any_processing = false;
+                    for (auto & slot : slots) {
+                        if (slot.is_processing()) {
+                            any_processing = true;
+                            break;
+                        }
+                    }
+                    if (any_processing) {
+                        SRV_DBG("model swap deferred, slot is busy, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    auto res = std::make_unique<server_task_result_model_swap>();
+                    res->id   = task.id;
+                    res->name = target;
+
+                    auto it = model_presets.find(target);
+                    if (it == model_presets.end()) {
+                        res->error = "model '" + target + "' is not found in the preset registry";
+                        SRV_ERR("%s\n", res->error.c_str());
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    // already loaded this model -> no-op success
+                    std::string preset_path;
+                    it->second.get_option("LLAMA_ARG_MODEL", preset_path);
+                    if (model_aliases.count(target) != 0 || (!preset_path.empty() && preset_path == params_base.model.path)) {
+                        SRV_INF("model '%s' is already loaded\n", target.c_str());
+                        res->model = model_name;
+                        res->path  = params_base.model.path;
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    // build the target params from pristine server defaults + preset
+                    common_params params_swapped = params_original;
+                    it->second.apply_to_params(params_swapped);
+
+                    common_params params_prev = params_base;
+
+                    // reject all pending tasks: they were tokenized against the old
+                    // model's vocabulary and must not run against the new model
+                    for (const int id_pending : queue_tasks.get_pending_task_ids()) {
+                        send_error(id_pending, "model is being swapped, request cancelled", ERROR_TYPE_SERVER);
+                    }
+                    queue_tasks.clear_all_tasks();
+
+                    // the prompt cache holds KV from the old model
+                    prompt_cache.reset();
+
+                    is_swapping = true;
+                    destroy();
+                    const bool swapped_ok = load_model(params_swapped);
+                    bool ok = swapped_ok;
+                    if (!swapped_ok) {
+                        SRV_ERR("model swap to '%s' failed, restoring previous model '%s'\n",
+                                target.c_str(), params_prev.model.path.c_str());
+                        ok = load_model(params_prev);
+                    }
+                    is_swapping = false;
+
+                    if (!ok) {
+                        res->error = "failed to load model '" + target + "' and failed to restore the previous model";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    if (!swapped_ok) {
+                        // previous model restored; it is fully usable and the existing
+                        // meta/chat_params remain valid for it
+                        res->error = "failed to load model '" + target + "', previous model restored";
+                        SRV_ERR("%s\n", res->error.c_str());
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    // the swap path skips init(), so the model-specific chat template
+                    // must be refreshed here
+                    if (!refresh_chat_params()) {
+                        SRV_WRN("%s", "chat template refresh failed after model swap\n");
+                    }
+
+                    if (callback_on_model_swapped) {
+                        callback_on_model_swapped();
+                    }
+
+                    SRV_INF("model swapped to '%s'\n", model_name.c_str());
+                    res->model = model_name;
+                    res->path  = params_base.model.path;
                     queue_results.send(std::move(res));
                 } break;
         }
@@ -4086,6 +4239,11 @@ void server_context::set_state_callback(server_state_callback_t callback) {
     });
 }
 
+void server_context::on_model_swapped(std::function<void()> callback) {
+    impl->callback_on_model_swapped = std::move(callback);
+}
+
+
 //
 // server_routes
 //
@@ -4102,6 +4260,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     auto completion_id = gen_chatcmplid();
     auto & rd = res->rd;
     auto & params = this->params;
+    auto meta = get_meta();
 
     res->set_req(&req); // will also set spipe if needed
 
@@ -4154,6 +4313,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->logit_bias_eog,
                     data);
 
+            // streaming is mandatory on this server: the connection must stay
+            // alive during long prefills and the client gets status/progress
+            // events. A client-supplied "stream": false is overridden.
+            task.params.stream = true;
+
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 
             task.id_slot = json_value(data, "id_slot", -1);
@@ -4181,7 +4345,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         return res;
     }
 
-    bool stream = json_value(data, "stream", false);
+    // streaming is mandatory on this server: the connection must stay alive
+    // during long prefills and the client gets status/progress events.
+    const bool stream = true;
+    if (data.contains("stream") && json_value(data, "stream", false) == false) {
+        SRV_WRN("%s", "requested \"stream\": false is not honored, this server always streams\n");
+    }
 
     if (!stream) {
         // non-stream, wait for the results
@@ -4576,6 +4745,8 @@ void server_routes::init_routes() {
         bool ctx_server; // do NOT delete this line
         GGML_UNUSED(ctx_server);
 
+        auto meta = get_meta();
+
         task_params tparams;
         tparams.sampling = params.sampling;
         json default_generation_settings_for_props = json {
@@ -4634,6 +4805,7 @@ void server_routes::init_routes() {
 
     this->post_infill = [this](const server_http_req & req) {
         auto res = create_response();
+        auto meta = get_meta();
         // check model compatibility
         std::string err;
         if (llama_vocab_fim_pre(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
@@ -4726,6 +4898,12 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files; // dummy
         const json body = json::parse(req.body);
+        // lazy in-process model swap based on the "model" field
+        json swap_error = swap_model_if_requested(req, res->rd, json_value(body, "model", std::string()));
+        if (!swap_error.empty()) {
+            res->error(swap_error);
+            return res;
+        }
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -4738,6 +4916,13 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
+        // lazy in-process model swap based on the "model" field
+        json swap_error = swap_model_if_requested(req, res->rd, json_value(body, "model", std::string()));
+        if (!swap_error.empty()) {
+            res->error(swap_error);
+            return res;
+        }
+        auto meta = get_meta(); // snapshot AFTER the swap
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -4794,9 +4979,17 @@ void server_routes::init_routes() {
     this->post_responses_oai = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files;
-        json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
+        json body_orig = json::parse(req.body);
+        // lazy in-process model swap based on the "model" field
+        json swap_error = swap_model_if_requested(req, res->rd, json_value(body_orig, "model", std::string()));
+        if (!swap_error.empty()) {
+            res->error(swap_error);
+            return res;
+        }
+        json body = server_chat_convert_responses_to_chatcmpl(std::move(body_orig));
         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
+        auto meta = get_meta(); // snapshot AFTER the swap
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -4815,6 +5008,7 @@ void server_routes::init_routes() {
 
     this->post_transcriptions_oai = [this](const server_http_req & req) {
         auto res = create_response();
+        auto meta = get_meta();
 
         if (!meta->has_mtmd || !meta->chat_params.allow_audio) {
             res->error(format_error_response("The current model does not support audio input.", ERROR_TYPE_NOT_SUPPORTED));
@@ -4844,9 +5038,17 @@ void server_routes::init_routes() {
     this->post_anthropic_messages = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files;
-        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
+        json body_orig = json::parse(req.body);
+        // lazy in-process model swap based on the "model" field
+        json swap_error = swap_model_if_requested(req, res->rd, json_value(body_orig, "model", std::string()));
+        if (!swap_error.empty()) {
+            res->error(swap_error);
+            return res;
+        }
+        json body = server_chat_convert_anthropic_to_oai(std::move(body_orig));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
+        auto meta = get_meta(); // snapshot AFTER the swap
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -4866,6 +5068,7 @@ void server_routes::init_routes() {
     // same with handle_chat_completions, but without inference part
     this->post_apply_template = [this](const server_http_req & req) {
         auto res = create_response();
+        auto meta = get_meta();
         std::vector<raw_buffer> files; // dummy, unused
         json body = json::parse(req.body);
         json data = oaicompat_chat_params_parse(
@@ -4883,6 +5086,43 @@ void server_routes::init_routes() {
         // the next LOC is to avoid someone accidentally use ctx_server
         bool ctx_server; // do NOT delete this line
         GGML_UNUSED(ctx_server);
+
+        auto meta = get_meta();
+
+        json data = json::array();
+
+        // the currently loaded model (first entry, for backward compat)
+        data.push_back(get_model_info());
+
+        // models registered in the preset registry (available for swapping)
+        for (const auto & [name, preset] : this->ctx_server.model_presets) {
+            std::string model_path;
+            preset.get_option("LLAMA_ARG_MODEL", model_path);
+            std::string aliases;
+            preset.get_option("LLAMA_ARG_ALIAS", aliases);
+            std::string n_ctx_str;
+            preset.get_option("LLAMA_ARG_CTX_SIZE", n_ctx_str);
+            const bool is_loaded = meta->model_aliases.count(name) != 0
+                                || (!model_path.empty() && meta->model_path == model_path);
+
+            data.push_back({
+                {"id",        name},
+                {"model",     name},
+                {"aliases",   aliases},
+                {"object",    "model"},
+                {"owned_by",  "llamacpp"},
+                {"created",   std::time(0)},
+                {"status",    is_loaded ? "loaded" : "unloaded"},
+                {"loaded",    is_loaded},
+                // configured context window; the actual slot window may be
+                // capped by the model's training context on load
+                {"context_length", n_ctx_str.empty() ? 0 : std::stoi(n_ctx_str)},
+                {"details",   {
+                    {"format",      "gguf"},
+                    {"model_path",  model_path},
+                }},
+            });
+        }
 
         json models = {
             {"models", {
@@ -4908,12 +5148,47 @@ void server_routes::init_routes() {
                 }
             }},
             {"object", "list"},
-            {"data", {
-                get_model_info(),
-            }}
+            {"data", data}
         };
 
         res->ok(models);
+        return res;
+    };
+
+    this->post_models_load = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        std::string name = json_value(body, "model", std::string());
+        if (name.empty()) {
+            res->error(format_error_response("\"model\" is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (this->ctx_server.resolve_preset_key(name).empty()) {
+            res->error(format_error_response("model '" + name + "' is not found in the preset registry", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_MODEL_SWAP);
+            task.id        = rd.get_new_id();
+            task.model_name = name;
+            rd.post_task(std::move(task), true); // high priority
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            // connection was closed
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        res->ok(result->to_json());
         return res;
     };
 
@@ -4982,6 +5257,7 @@ void server_routes::init_routes() {
 
     this->post_rerank = [this](const server_http_req & req) {
         auto res = create_response();
+        auto meta = get_meta();
         if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
             res->error(format_error_response("This server does not support reranking. Start it with `--reranking`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
@@ -5124,6 +5400,7 @@ void server_routes::init_routes() {
 }
 
 json server_routes::get_model_info() const {
+    auto meta = get_meta();
     return json {
         {"id",       meta->model_name},
         {"aliases",  meta->model_aliases},
@@ -5246,6 +5523,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
 
 std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(const server_http_req & req, task_response_type res_type) {
     auto res = create_response();
+    auto meta = get_meta();
     if (!params.embedding) {
         res->error(format_error_response("This server does not support embeddings. Start it with `--embeddings`", ERROR_TYPE_NOT_SUPPORTED));
         return res;
@@ -5391,4 +5669,36 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
     }
     res->ok(response);
     return res;
+}
+
+json server_routes::swap_model_if_requested(const server_http_req & req, server_response_reader & rd, const std::string & name) {
+    const std::string key = this->ctx_server.resolve_preset_key(name);
+    // not a registered preset (or alias) -> leave it to the current model
+    if (key.empty()) {
+        return json();
+    }
+
+    // already loaded -> no-op
+    auto meta = get_meta();
+    std::string preset_path;
+    this->ctx_server.model_presets.at(key).get_option("LLAMA_ARG_MODEL", preset_path);
+    if (meta->model_aliases.count(name) != 0 || (!preset_path.empty() && meta->model_path == preset_path)) {
+        return json();
+    }
+
+    server_task task(SERVER_TASK_TYPE_MODEL_SWAP);
+    task.id         = rd.get_new_id();
+    task.model_name = name;
+    rd.post_task(std::move(task), true); // high priority
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        // connection was closed mid-swap
+        return format_error_response("connection closed during model swap", ERROR_TYPE_SERVER);
+    }
+    if (result->is_error()) {
+        return result->to_json();
+    }
+
+    return json();
 }
