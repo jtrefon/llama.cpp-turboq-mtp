@@ -53,9 +53,20 @@ target_include_directories(llama PRIVATE .)
 target_include_directories(llama PUBLIC ../include)
 if (GGML_CUDA)
     # fork: async checkpoint capture (llama-context.cpp/common.cpp) uses the CUDA
-    # runtime API (events, pinned host memory); expose the toolkit headers
-    get_target_property(CUDA_RT_INC CUDA::cudart INTERFACE_INCLUDE_DIRECTORIES)
-    target_include_directories(llama PRIVATE ${CUDA_RT_INC})
+    # runtime API (events, pinned host memory); expose the toolkit headers.
+    # CUDA::cudart is only defined when CUDAToolkit was found; fall back to the
+    # compiler-relative toolkit root otherwise.
+    if (NOT TARGET CUDA::cudart)
+        find_package(CUDAToolkit QUIET)
+    endif()
+    if (TARGET CUDA::cudart)
+        get_target_property(CUDA_RT_INC CUDA::cudart INTERFACE_INCLUDE_DIRECTORIES)
+        target_include_directories(llama PRIVATE ${CUDA_RT_INC})
+    elseif (CMAKE_CUDA_COMPILER)
+        get_filename_component(CUDA_BIN_DIR ${CMAKE_CUDA_COMPILER} DIRECTORY)
+        get_filename_component(CUDA_ROOT ${CUDA_BIN_DIR} DIRECTORY)
+        target_include_directories(llama PRIVATE ${CUDA_ROOT}/include)
+    endif()
 endif()
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
