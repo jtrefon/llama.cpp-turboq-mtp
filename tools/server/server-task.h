@@ -27,6 +27,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_MODEL_SWAP,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -52,7 +53,7 @@ struct task_params {
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
-    bool return_progress = false;
+    bool return_progress = true; // emit prompt-processing progress events in stream mode (client can disable via return_progress:false)
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
 
@@ -174,6 +175,9 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_MODEL_SWAP
+    std::string model_name;
 
     server_task() = default;
 
@@ -567,6 +571,19 @@ struct server_task_result_control : server_task_result {
         }
         return out;
     }
+};
+
+struct server_task_result_model_swap : server_task_result {
+    std::string name;     // the requested model name (preset key)
+    std::string model;    // the resolved model_name (alias) of the newly loaded model
+    std::string path;     // the model file path
+    std::string error;    // empty on success
+
+    virtual bool is_error() override {
+        return !error.empty();
+    }
+
+    virtual json to_json() override;
 };
 
 struct server_task_result_get_lora : server_task_result {
