@@ -1134,7 +1134,7 @@ struct common_prompt_checkpoint {
     common_prompt_checkpoint(const common_prompt_checkpoint & o);
     common_prompt_checkpoint & operator=(const common_prompt_checkpoint & o);
 
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     // RTX-4090 / NVIDIA-dedicated: async checkpoint capture state.
     // The state is captured with llama_state_seq_get_data_ext_async into a pinned
     // staging buffer; a CUDA host callback then copies it into data_tgt/data_dft
