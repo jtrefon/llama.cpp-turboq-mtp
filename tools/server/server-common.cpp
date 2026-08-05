@@ -1086,12 +1086,23 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
-    // Parse also the OAI "reasoning_effort": "none" specific value
+    // Parse the OAI "reasoning_effort" value ("none" | "min" | "low" | "medium" | "high" | "max").
+    // OpenAI clients use effort levels instead of raw token budgets; map each
+    // level to a fraction of the server default budget (--reasoning-budget).
+    // An explicit reasoning_budget_tokens in the request still wins.
+    int effort_budget = -1;
     if (body.contains("reasoning_effort")) {
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
-        } // other reasoning_effort values are model-specific and not yet handled
+        } else if (opt.reasoning_budget > 0) {
+            float factor = 1.0f;
+            if      (reasoning_effort == "min"    || reasoning_effort == "low")   factor = 0.25f;
+            else if (reasoning_effort == "medium")                                factor = 0.5f;
+            else if (reasoning_effort == "high")                                  factor = 1.0f;
+            else if (reasoning_effort == "max")                                   factor = 2.0f;
+            effort_budget = std::max(1, (int) std::round(opt.reasoning_budget * factor));
+        }
     }
 
     inputs.force_pure_content = opt.force_pure_content;
@@ -1216,7 +1227,7 @@ json oaicompat_chat_params_parse(
         int reasoning_budget = json_value(body, "reasoning_budget_tokens",
                                json_value(body, "thinking_budget_tokens", -1));
         if (reasoning_budget == -1) {
-            reasoning_budget = opt.reasoning_budget;
+            reasoning_budget = effort_budget >= 0 ? effort_budget : opt.reasoning_budget;
         }
 
         if (!chat_params.thinking_end_tags.empty()) {
