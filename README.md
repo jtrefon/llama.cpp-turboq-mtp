@@ -125,6 +125,18 @@ Everything below is selectable at runtime or build time; nothing is hardcoded.
 
 Requires `--flash-attn on`. `planar*_0`/`iso*_0` require the build flag `GGML_CUDA_FA_ALL_QUANTS=ON` (below).
 
+### Runtime: reasoning budget / effort (OpenAI-compatible)
+
+Clients control the thinking budget per request:
+
+| Field | Effect |
+|-------|--------|
+| `reasoning_budget_tokens: <n>` | Explicit thinking budget in tokens (chat completions; alias: `thinking_budget_tokens`) |
+| `reasoning_effort: "min" \| "low" \| "medium" \| "high" \| "max"` | Maps to a fraction of the server default (`--reasoning-budget`): 0.25x / 0.25x / 0.5x / 1.0x / 2.0x. Explicit `reasoning_budget_tokens` wins over effort. `"none"` disables thinking |
+| `thinking: {type:"enabled", budget_tokens: <n>}` | Anthropic `/v1/messages` equivalent |
+
+The server default comes from `--reasoning-budget` (the `[*]` global preset sets 8192).
+
 ### Runtime: environment variables
 
 | Variable | Effect |
