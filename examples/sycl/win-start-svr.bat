@@ -9,7 +9,7 @@ set "BIN_FILE=.\build\bin\llama-server.exe"
 set "SEED=0"
 set "GPUS_SETTING="
 
-set "MODEL_FILE=..\models\Qwen3.5-4B-Q4_0.gguf"
+set "MODEL_FILE=..\models\Qwen3.6-27B-Q4_K_M.gguf"
 set "NGL=99"
 set "CONTEXT=4096"
 set "GGML_SYCL_DEVICE=-1"

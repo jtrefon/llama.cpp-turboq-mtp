@@ -37,7 +37,7 @@ BIN_FILE=./build/bin/llama-server
 SEED=0
 GPUS_SETTING=""
 
-MODEL_FILE=../models/Qwen3.5-4B-Q4_0.gguf
+MODEL_FILE=../models/Qwen3.6-27B-Q4_K_M.gguf
 NGL=99
 CONTEXT=4096
 GGML_SYCL_DEVICE=-1

@@ -92,7 +92,7 @@ feature-flagged alternative (A/B comparison pending — see "Feature Flags"):
 
 ```bash
 ./build-mtp/bin/llama-server \
-  -m your-qwen3.6-mtp.gguf \
+  -m Qwopus3.6-27B-v2-MTP-Q4_K_M.gguf \
   --spec-type draft-mtp --spec-draft-n-max 3 \
   -ctk tbq4_0 -ctv tbq4_0 -c 262144 -ngl 99 \
   --flash-attn on --mlock -t 8 -ub 32 -np 1 --no-warmup
@@ -154,7 +154,7 @@ model-swap PR (feature/model-hot-swap) for details; `swap-model.sh` is the CLI h
 
 Upstream `ggml-org/llama.cpp` merged official MTP support via [PR #22673](https://github.com/ggml-org/llama.cpp/pull/22673) (`255582687`), which uses `--spec-type draft-mtp`. The Aug 2026 sync absorbed it (plus EAGLE3/DFlash/DSpark speculative types). The fork's custom MTP (`--spec-type mtp`) is being re-ported on top and will be **feature-flagged side-by-side** with `draft-mtp` so both can be A/B tested on identical hardware — see "Feature Flags" below.
 
-Historical head-to-head (May 2026, RTX 4090 24GB, Qwen3.6-27B-Heretic-v2-MTP Q4_K_M; note: upstream MTP was measured on a base without our TBQ4 KV/FA stack):
+Historical head-to-head (May 2026, RTX 4090 24GB, Qwen3.6-27B + MTP Q4_K_M; note: upstream MTP was measured on a base without our TBQ4 KV/FA stack):
 
 | Metric | Upstream MTP | Our Fork | Delta |
 |--------|:-----------:|:--------:|:-----:|
@@ -168,7 +168,20 @@ Historical head-to-head (May 2026, RTX 4090 24GB, Qwen3.6-27B-Heretic-v2-MTP Q4_
 
 The TBQ4 + RotorQuant + tensor sharing KV/FA stack is fork-owned and orthogonal to the MTP choice — it works with either implementation.
 
-## Results (Qwen3.6-27B-Heretic-v2-MTP Q4_K_M, RTX 4090 24GB)
+## Supported Models (Qwen3.6 family)
+
+| Model | Type | Variant | Notes |
+|-------|------|---------|-------|
+| qwen3.6-27b | dense | base | full attention, no MTP |
+| qwen3.6-27b + MTP | dense | pi-reasoning | trained MTP head, pi-style reasoning |
+| qwopus3.6-27b-v2 + MTP | dense | qwopus | 15 native MTP heads (Qwopus v2) |
+| qwen3.6-35b-a3b | MoE | base | 35B total / 3B active, unsloth dynamic quants |
+
+MTP variants require `--spec-type draft-mtp --spec-draft-n-max 3` (upstream MTP).
+The fork-native `--spec-type mtp` is not wired in the current baseline (re-port in
+progress); it is not usable until then.
+
+## Results (Qwen3.6-27B + MTP Q4_K_M, RTX 4090 24GB)
 
 | Config | Context | KV Cache | tok/s | Draft Accept | VRAM |
 |--------|---------|----------|-------|-------------|------|
