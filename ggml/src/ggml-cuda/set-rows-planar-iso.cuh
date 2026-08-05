@@ -92,7 +92,8 @@ __device__ void quantize_f32_planar3_block(const float * x, block_planar3_0 * ds
     }
 
     float recon_norm = sqrtf(recon_sq);
-    dst->d = __float2half(recon_norm > 1e-10f ? grp_norm / recon_norm : grp_norm);
+    const float d_val = recon_norm > 1e-10f ? grp_norm / recon_norm : grp_norm;
+    dst->d = __float2half(d_val);
 }
 
 // ── Iso3: F32[128] → block_iso3_0 (quaternion rotation) ────────────
@@ -131,7 +132,8 @@ __device__ void quantize_f32_iso3_block(const float * x, block_iso3_0 * dst) {
     }
 
     float recon_norm = sqrtf(recon_sq);
-    dst->d = __float2half(recon_norm > 1e-10f ? grp_norm / recon_norm : grp_norm);
+    const float d_val = recon_norm > 1e-10f ? grp_norm / recon_norm : grp_norm;
+    dst->d = __float2half(d_val);
 }
 
 // ── Planar4: F32[128] → block_planar4_0 (Givens + 4-bit nibble) ────
@@ -163,7 +165,8 @@ __device__ void quantize_f32_planar4_block(const float * x, block_planar4_0 * ds
     }
 
     float recon_norm = sqrtf(recon_sq);
-    dst->d = __float2half(recon_norm > 1e-10f ? grp_norm / recon_norm : grp_norm);
+    const float d_val = recon_norm > 1e-10f ? grp_norm / recon_norm : grp_norm;
+    dst->d = __float2half(d_val);
     // rnorm not in our 66-byte block layout
 }
 
@@ -199,7 +202,8 @@ __device__ void quantize_f32_iso4_block(const float * x, block_iso4_0 * dst) {
     }
 
     float recon_norm = sqrtf(recon_sq);
-    dst->d = __float2half(recon_norm > 1e-10f ? grp_norm / recon_norm : grp_norm);
+    const float d_val = recon_norm > 1e-10f ? grp_norm / recon_norm : grp_norm;
+    dst->d = __float2half(d_val);
     // rnorm not in our 66-byte block layout
 }
 
@@ -224,7 +228,8 @@ __device__ void quantize_f32_planar3_block_norot(const float * x, block_planar3_
         recon_sq += PI_CENTROIDS_3BIT[idx] * PI_CENTROIDS_3BIT[idx];
     }
     float rn = sqrtf(recon_sq);
-    dst->d = __float2half(rn > 1e-10f ? grp_norm / rn : grp_norm);
+    const float d_val = rn > 1e-10f ? grp_norm / rn : grp_norm;
+    dst->d = __float2half(d_val);
 }
 
 __device__ void quantize_f32_iso3_block_norot(const float * x, block_iso3_0 * dst) {
@@ -246,7 +251,8 @@ __device__ void quantize_f32_planar4_block_norot(const float * x, block_planar4_
         recon_sq += PI_CENTROIDS_4BIT[idx] * PI_CENTROIDS_4BIT[idx];
     }
     float rn = sqrtf(recon_sq);
-    dst->d = __float2half(rn > 1e-10f ? grp_norm / rn : grp_norm);
+    const float d_val = rn > 1e-10f ? grp_norm / rn : grp_norm;
+    dst->d = __float2half(d_val);
     // rnorm not in our 66-byte block layout
 }
 
