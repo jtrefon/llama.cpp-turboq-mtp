@@ -23,6 +23,16 @@ extern void ggml_cuda_init_planar_iso_constants();
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
+// forward decls (missing-declarations -Werror)
+__device__ void quantize_f32_planar3_block(const float * x, block_planar3_0 * dst);
+__device__ void quantize_f32_iso3_block(const float * x, block_iso3_0 * dst);
+__device__ void quantize_f32_planar4_block(const float * x, block_planar4_0 * dst);
+__device__ void quantize_f32_iso4_block(const float * x, block_iso4_0 * dst);
+__device__ void quantize_f32_planar3_block_norot(const float * x, block_planar3_0 * dst);
+__device__ void quantize_f32_iso3_block_norot(const float * x, block_iso3_0 * dst);
+__device__ void quantize_f32_planar4_block_norot(const float * x, block_planar4_0 * dst);
+__device__ void quantize_f32_iso4_block_norot(const float * x, block_iso4_0 * dst);
+
 __device__ __forceinline__ uint8_t sr_quantize_3bit(float val, const float * mid) {
     uint8_t idx = 0;
     if      (val < mid[0]) idx = 0;
