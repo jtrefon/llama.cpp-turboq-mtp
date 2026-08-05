@@ -21,7 +21,7 @@
 #include <filesystem>
 #include <mutex>
 
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #include <cuda_runtime.h>
 #endif
 #include <fstream>
@@ -2109,7 +2109,7 @@ bool common_prompt_batch_decode(
     return true;
 }
 
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // RTX-4090 / NVIDIA-dedicated: small rotating pool of PINNED host buffers used as
 // staging for async checkpoint D2H copies. Bounded to N slots (~2x max checkpoint
 // size) so pinned (locked) RAM stays tiny; the CUDA host callback releases a slot
@@ -2186,7 +2186,7 @@ bool common_prompt_checkpoint::empty() const {
 }
 
 void common_prompt_checkpoint::clear() {
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (async_active_tgt && !copied_tgt.load()) {
         cudaStreamSynchronize(cudaStreamPerThread);
     }
@@ -2240,7 +2240,7 @@ void common_prompt_checkpoint::update_tgt(
 
     data_tgt.resize(ckpt_size);
 
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     // RTX-4090 / NVIDIA-dedicated: capture asynchronously into a pinned staging
     // buffer so the D2H transfer overlaps with subsequent prefill compute.
     int slot = g_ckpt_staging.acquire(ckpt_size);
@@ -2283,7 +2283,7 @@ void common_prompt_checkpoint::update_dft(
 
     data_dft.resize(ckpt_size);
 
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     int slot = g_ckpt_staging.acquire(ckpt_size);
     if (slot < 0) {
         cudaStreamSynchronize(cudaStreamPerThread);
@@ -2323,7 +2323,7 @@ void common_prompt_checkpoint::load_tgt(
         return;
     }
 
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     // ensure the async capture + host callback finished before reading data_tgt
     if (async_active_tgt && !copied_tgt.load(std::memory_order_acquire)) {
         cudaStreamSynchronize(cudaStreamPerThread);
@@ -2348,7 +2348,7 @@ void common_prompt_checkpoint::load_dft(
         return;
     }
 
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (async_active_dft && !copied_dft.load(std::memory_order_acquire)) {
         cudaStreamSynchronize(cudaStreamPerThread);
     }
@@ -2361,7 +2361,7 @@ void common_prompt_checkpoint::load_dft(
 }
 
 common_prompt_checkpoint::~common_prompt_checkpoint() {
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     // wait for any in-flight async capture callback, then free the CUDA event
     if (async_active_tgt && !copied_tgt.load()) {
         cudaStreamSynchronize(cudaStreamPerThread);
@@ -2387,7 +2387,7 @@ common_prompt_checkpoint::common_prompt_checkpoint(common_prompt_checkpoint && o
       data_tgt(std::move(o.data_tgt)),
       data_dft(std::move(o.data_dft)),
       data_spec(std::move(o.data_spec))
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
       , cuda_event_tgt(o.cuda_event_tgt)
       , cuda_event_dft(o.cuda_event_dft)
       , staging_slot_tgt(o.staging_slot_tgt)
@@ -2398,7 +2398,7 @@ common_prompt_checkpoint::common_prompt_checkpoint(common_prompt_checkpoint && o
       , async_active_dft(o.async_active_dft)
 #endif
 {
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     // take ownership; clear source so its destructor leaves our resources alone
     o.cuda_event_tgt   = nullptr;
     o.cuda_event_dft   = nullptr;
@@ -2423,7 +2423,7 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_che
         data_dft = std::move(o.data_dft);
         data_spec = std::move(o.data_spec);
 
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         cuda_event_tgt   = o.cuda_event_tgt;
         cuda_event_dft   = o.cuda_event_dft;
         staging_slot_tgt = o.staging_slot_tgt;
@@ -2453,7 +2453,7 @@ common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoin
       data_tgt(o.data_tgt),
       data_dft(o.data_dft),
       data_spec(o.data_spec)
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
       , copied_tgt(o.copied_tgt.load())
       , copied_dft(o.copied_dft.load())
       // cuda_event_*/staging_slot_*/async_active_* stay at defaults: copies only

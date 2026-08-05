@@ -51,6 +51,12 @@ set_target_properties(llama PROPERTIES
 
 target_include_directories(llama PRIVATE .)
 target_include_directories(llama PUBLIC ../include)
+if (GGML_CUDA)
+    # fork: async checkpoint capture (llama-context.cpp/common.cpp) uses the CUDA
+    # runtime API (events, pinned host memory); expose the toolkit headers
+    get_target_property(CUDA_RT_INC CUDA::cudart INTERFACE_INCLUDE_DIRECTORIES)
+    target_include_directories(llama PRIVATE ${CUDA_RT_INC})
+endif()
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)

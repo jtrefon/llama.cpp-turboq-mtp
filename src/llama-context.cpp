@@ -19,11 +19,11 @@
 #include <stdexcept>
 #include <string>
 
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #include <cuda_runtime.h>
 #endif
 
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #define CUDA_CHECK(x)                                                                      \
     do {                                                                                   \
         cudaError_t _e = (x);                                                              \
@@ -2618,7 +2618,7 @@ class llama_io_write_host_async : public llama_io_write_i {
 public:
     llama_io_write_host_async(
             uint8_t * p, size_t len, ggml_backend_sched_t sched) : ptr(p), buf_size(len)
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             , sched(sched)
 #endif
     {
@@ -2626,7 +2626,7 @@ public:
     }
 
     ~llama_io_write_host_async() {
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         for (const auto & winfo : winfos) {
             ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, winfo.tensor);
             if (backend != nullptr) {
@@ -2675,7 +2675,7 @@ private:
     size_t buf_size = 0;
     size_t size_written = 0;
 
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     ggml_backend_sched_t sched;
 #endif
 
@@ -3076,7 +3076,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags, void * cuda_event_out) {
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     // Ensure the state is fully computed before issuing the async copies.
     synchronize();
 
@@ -4204,7 +4204,7 @@ size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t s
 // llama_state_seq_capture_wait before consuming the data). Falls back to the
 // synchronous path when CUDA is unavailable.
 size_t llama_state_seq_get_data_ext_async(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, void * cuda_event_out) {
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     return ctx->state_seq_get_data_async(seq_id, dst, size, flags, cuda_event_out);
 #else
     (void) cuda_event_out;
@@ -4214,7 +4214,7 @@ size_t llama_state_seq_get_data_ext_async(llama_context * ctx, uint8_t * dst, si
 
 // RTX-4090 / NVIDIA-dedicated: wait for an async checkpoint capture to finish.
 void llama_state_seq_capture_wait(llama_context * /*ctx*/, void * cuda_event) {
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     cudaEvent_t ev = *(cudaEvent_t *) cuda_event;
     CUDA_CHECK(cudaEventSynchronize(ev));
     CUDA_CHECK(cudaEventDestroy(ev));
