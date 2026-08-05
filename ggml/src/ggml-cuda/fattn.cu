@@ -607,6 +607,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32;
             need_f16_V = V->type == GGML_TYPE_F32;
             break;
+        case BEST_FATTN_KERNEL_MMA_TBQ4:
+            // raw TBQ4/TBQ3/planar/iso blocks pass through to the fused kernel
+            need_f16_K = false;
+            need_f16_V = false;
+            break;
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
