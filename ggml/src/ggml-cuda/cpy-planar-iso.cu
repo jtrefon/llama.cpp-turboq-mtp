@@ -8,6 +8,8 @@
 
 #include "common.cuh"
 #include "ggml-common.h"
+#include "cpy-planar-iso.cuh"
+#include "cpy-planar-iso.cuh"
 
 #include <cmath>
 
