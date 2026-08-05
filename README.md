@@ -132,10 +132,10 @@ Clients control the thinking budget per request:
 | Field | Effect |
 |-------|--------|
 | `reasoning_budget_tokens: <n>` | Explicit thinking budget in tokens (chat completions; alias: `thinking_budget_tokens`) |
-| `reasoning_effort: "min" \| "low" \| "medium" \| "high" \| "max"` | Maps to a fraction of the server default (`--reasoning-budget`): 0.25x / 0.25x / 0.5x / 1.0x / 2.0x. Explicit `reasoning_budget_tokens` wins over effort. `"none"` disables thinking |
+| `reasoning_effort: "none" \| "min" \| "low" \| "medium" \| "high" \| "max"` | Absolute thinking-budget ladder: 0 / 1024 / 1024 / 4096 / 8192 / 16384 tokens. Explicit `reasoning_budget_tokens` wins over effort |
 | `thinking: {type:"enabled", budget_tokens: <n>}` | Anthropic `/v1/messages` equivalent |
 
-The server default comes from `--reasoning-budget` (the `[*]` global preset sets 8192).
+Reasoning is on by default (`reasoning = on` in the global preset) with **no fixed budget** — when the client sends neither a budget nor an effort level, the model thinks as long as it needs. The API (`reasoning_effort` / `reasoning_budget_tokens`) is the single control for reasoning strength.
 
 ### Runtime: environment variables
 
