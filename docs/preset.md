@@ -28,8 +28,8 @@ kv-unified           = 1
 parallel             = 4
 spec-default         = 1
 
-[Qwen3.5-4B]
-hf                   = unsloth/Qwen3.5-4B-GGUF:Q4_K_M
+[Qwen3.6-27B]
+hf                   = unsloth/Qwen3.6-27B-GGUF:Q4_K_M
 ctx-size             = 262144
 batch-size           = 2048
 ubatch-size          = 2048
@@ -37,6 +37,18 @@ top-p                = 1.0
 top-k                = 0
 min-p                = 0.01
 temp                 = 1.0
+
+[Qwen3.6-35B-A3B]
+hf                   = unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M
+ctx-size             = 262144
+batch-size           = 2048
+ubatch-size          = 2048
+top-p                = 1.0
+top-k                = 0
+min-p                = 0.01
+temp                 = 1.0
+spec-type            = draft-mtp
+spec-draft-n-max     = 3
 
 [gpt-oss-120b-hf]
 hf                   = ggml-org/gpt-oss-120b-GGUF
