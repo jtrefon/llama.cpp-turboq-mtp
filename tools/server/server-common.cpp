@@ -1088,21 +1088,22 @@ json oaicompat_chat_params_parse(
 
     // Parse the OAI "reasoning_effort" value ("none" | "min" | "low" | "medium" | "high" | "max").
     // OpenAI clients use effort levels instead of raw token budgets; map each
-    // level to a fraction of the server default budget (--reasoning-budget).
-    // An explicit reasoning_budget_tokens in the request still wins.
+    // level to an absolute thinking-budget ladder, independent of any server
+    // default budget (so the API is the single control). An explicit
+    // reasoning_budget_tokens in the request still wins.
     int effort_budget = -1;
     if (body.contains("reasoning_effort")) {
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
-        } else if (opt.reasoning_budget > 0) {
-            float factor = 1.0f;
-            if      (reasoning_effort == "min"    || reasoning_effort == "low")   factor = 0.25f;
-            else if (reasoning_effort == "medium")                                factor = 0.5f;
-            else if (reasoning_effort == "high")                                  factor = 1.0f;
-            else if (reasoning_effort == "max")                                   factor = 2.0f;
-            effort_budget = std::max(1, (int) std::round(opt.reasoning_budget * factor));
-        }
+            // do not extract reasoning from the output either: the model may
+            // still emit thinking text, but the response must not surface it
+            inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+            llama_params["reasoning_format"] = "none";
+        } else if      (reasoning_effort == "min"    || reasoning_effort == "low")   effort_budget = 1024;
+        else if        (reasoning_effort == "medium")                                 effort_budget = 4096;
+        else if        (reasoning_effort == "high")                                   effort_budget = 8192;
+        else if        (reasoning_effort == "max")                                    effort_budget = 16384;
     }
 
     inputs.force_pure_content = opt.force_pure_content;

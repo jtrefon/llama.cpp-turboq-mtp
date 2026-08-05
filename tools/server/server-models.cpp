@@ -1414,6 +1414,96 @@ void server_child::notify_to_router(const std::string & state, const json & payl
 // server_models_routes
 //
 
+// Streaming proxy with model-load status events.
+// While the child server spawns/loads, the stream emits throttled SSE status
+// events so clients see progress instead of sitting in a silent wait (long
+// loads used to trip client-side timeouts). Once the model is ready the
+// child's stream is piped through unchanged.
+struct router_proxy_stream_state {
+    server_models * self = nullptr;
+    std::string name;
+    bool autoload = false;
+    std::string conv_id;
+    uint64_t ticket = 0;
+    std::string req_path;
+    std::string req_query;
+    std::map<std::string, std::string> req_headers;
+    std::string req_body;
+    std::map<std::string, uploaded_file> req_files;
+    const std::function<bool()> * should_stop = nullptr;
+
+    bool load_triggered    = false;
+    bool ready_before_wait = false;
+    bool proxy_started     = false;
+    bool finished          = false;
+    int64_t t_last_tick_ms = 0;
+    std::shared_ptr<server_http_res> proxy;
+};
+
+static bool router_proxy_stream_next(router_proxy_stream_state & st, std::string & out) {
+    if (st.finished) {
+        return false;
+    }
+
+    const int64_t t_now = ggml_time_ms();
+
+    auto meta = st.self->get_meta(st.name);
+    if (!meta.has_value()) {
+        out = "data: {\"error\":{\"message\":\"model not found: " + st.name + "\"}}\n\n";
+        st.finished = true;
+        return false;
+    }
+
+    // phase 1: initial status + trigger the (asynchronous) child spawn
+    if (!st.load_triggered) {
+        st.load_triggered    = true;
+        st.ready_before_wait = meta->is_ready();
+        if (st.ready_before_wait) {
+            return true; // ready: go straight to proxying
+        }
+        if (meta->status == SERVER_MODEL_STATUS_UNLOADED) {
+            st.self->load(st.name);
+        }
+        out = "data: {\"status\":\"loading\",\"model\":\"" + st.name + "\"}\n\n";
+        st.t_last_tick_ms = t_now;
+        return true;
+    }
+
+    // phase 2: wait for the load, emit throttled status ticks
+    if (!st.ready_before_wait && !meta->is_ready()) {
+        if (t_now - st.t_last_tick_ms < 1000) {
+            // poll with a short nap instead of spinning
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            return true; // empty chunk, nothing sent
+        }
+        st.t_last_tick_ms = t_now;
+        out = "data: {\"status\":\"loading\",\"model\":\"" + st.name + "\"}\n\n";
+        return true;
+    }
+
+    // phase 3: ready -> start the child proxy
+    if (!st.proxy_started) {
+        st.proxy_started = true;
+        if (st.ticket != 0 && !st.self->conv_models.alive(st.conv_id, st.ticket)) {
+            out = "data: {\"error\":{\"message\":\"request cancelled while the model was loading\"}}\n\n";
+            st.finished = true;
+            return false;
+        }
+        const bool waited = !st.ready_before_wait;
+        server_http_req r{
+            {}, st.req_headers, st.req_path, st.req_query, st.req_body, st.req_files, *st.should_stop};
+        st.proxy = st.self->proxy_request(r, "POST", st.name, true, waited && st.ticket != 0);
+        return true;
+    }
+
+    // phase 4: pipe the child stream
+    const bool has_next = st.proxy->next(out);
+    if (!has_next) {
+        st.finished = true;
+    }
+    return has_next;
+}
+
 // RAII wrapper similar to server_response_reader, but doesn't use server_queue
 static std::atomic<int> sse_client_id_counter = 0;
 struct server_models_sse_client {
@@ -1588,6 +1678,39 @@ void server_models_routes::init_routes() {
         // this request instead of leaving an orphan generation
         std::string conv_id = server_stream_conv_id_from_headers(req.headers);
         uint64_t ticket = models.conv_models.remember(conv_id, name);
+
+        // generation endpoints stream on this server (the child forces streaming
+        // too). Return a streaming response immediately and emit model-load
+        // status events while the child spawns, so clients never sit in a
+        // silent wait (long loads used to trip client timeouts).
+        if (json_value(body, "stream", true)) {
+            auto state = std::make_shared<router_proxy_stream_state>();
+            state->self        = &models;
+            state->name        = name;
+            state->autoload    = autoload;
+            state->conv_id     = conv_id;
+            state->ticket      = ticket;
+            state->req_path    = req.path;
+            state->req_query   = req.query_string;
+            state->req_headers = req.headers;
+            state->req_body    = req.body;
+            state->req_files   = req.files;
+            state->should_stop = &req.should_stop;
+
+            auto res = std::make_unique<server_http_res>();
+            res->status       = 200;
+            res->content_type = "text/event-stream";
+            res->headers["Cache-Control"]     = "no-cache";
+            res->headers["Connection"]        = "keep-alive";
+            res->headers["X-Accel-Buffering"] = "no";
+            res->next = [state](std::string & out) -> bool {
+                return router_proxy_stream_next(*state, out);
+            };
+            return res;
+        }
+
+        // non-streamed requests keep the synchronous wait (rare: generation
+        // endpoints always stream; this covers e.g. tokenize while loading)
         bool waited = autoload && models.ensure_model_ready(name);
         if (ticket != 0 && !models.conv_models.alive(conv_id, ticket)) {
             SRV_INF("request for conv_id=%s cancelled while model name=%s was loading\n",
@@ -1599,7 +1722,7 @@ void server_models_routes::init_routes() {
         // a session request that waited for a load detaches from the client socket: the
         // client may have dropped during the wait (page reload) and the session buffer must
         // still receive the generation for a later resume
-        return models.proxy_request(req, method, name, true, waited && ticket != 0); // update last usage for POST request only
+        return models.proxy_request(req, method, name, true, waited && ticket != 0);
     };
 
     this->post_router_models_load = [this](const server_http_req & req) {

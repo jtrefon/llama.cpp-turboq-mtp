@@ -53,7 +53,7 @@ struct task_params {
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
-    bool return_progress = false;
+    bool return_progress = true; // emit prompt-processing progress events in stream mode (client can disable via return_progress:false)
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
 
