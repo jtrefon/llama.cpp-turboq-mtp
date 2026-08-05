@@ -33,6 +33,11 @@ __device__ void quantize_f32_iso3_block_norot(const float * x, block_iso3_0 * ds
 __device__ void quantize_f32_planar4_block_norot(const float * x, block_planar4_0 * dst);
 __device__ void quantize_f32_iso4_block_norot(const float * x, block_iso4_0 * dst);
 
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsuggest-attribute=noreturn"
+#endif
+
 __device__ __forceinline__ uint8_t sr_quantize_3bit(float val, const float * mid) {
     uint8_t idx = 0;
     if      (val < mid[0]) idx = 0;
@@ -259,3 +264,6 @@ __device__ void quantize_f32_planar4_block_norot(const float * x, block_planar4_
 __device__ void quantize_f32_iso4_block_norot(const float * x, block_iso4_0 * dst) {
     quantize_f32_planar4_block_norot(x, (block_planar4_0 *)dst);
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
