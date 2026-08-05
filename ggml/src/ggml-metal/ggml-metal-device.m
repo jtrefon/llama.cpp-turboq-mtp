@@ -1417,7 +1417,15 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
-            return op->src[0]->type != GGML_TYPE_NVFP4;
+            // fork KV types have no Metal kernels (CUDA-only); the get_rows
+            // pipeline would fail to compile and the caller segfaults on null
+            return op->src[0]->type != GGML_TYPE_NVFP4 &&
+                   op->src[0]->type != GGML_TYPE_TBQ3_0 &&
+                   op->src[0]->type != GGML_TYPE_TBQ4_0 &&
+                   op->src[0]->type != GGML_TYPE_PLANAR3_0 &&
+                   op->src[0]->type != GGML_TYPE_ISO3_0 &&
+                   op->src[0]->type != GGML_TYPE_PLANAR4_0 &&
+                   op->src[0]->type != GGML_TYPE_ISO4_0;
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type == GGML_TYPE_F16) {
