@@ -64,6 +64,12 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // graph topology fingerprint: for DSV4-style memories the compressed-gather
+    // graph width grows with the context depth (n_visible rows per position),
+    // so a graph built at depth D cannot be reused at a larger depth. 0 = the
+    // graph topology does not depend on the memory state.
+    virtual uint64_t graph_vis_fingerprint() const { return 0; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
