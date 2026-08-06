@@ -4313,11 +4313,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->logit_bias_eog,
                     data);
 
-            // streaming is mandatory on this server: the connection must stay
-            // alive during long prefills and the client gets status/progress
-            // events. A client-supplied "stream": false is overridden.
-            task.params.stream = true;
-
+            // honor the client's stream flag; for non-stream requests, disable
+            // progress results so wait_for_all() sees exactly one result per task
+            task.params.stream = json_value(data, "stream", false);
+            if (!task.params.stream) {
+                task.params.return_progress = false;
+            }
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 
             task.id_slot = json_value(data, "id_slot", -1);
@@ -4345,12 +4346,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         return res;
     }
 
-    // streaming is mandatory on this server: the connection must stay alive
-    // during long prefills and the client gets status/progress events.
-    const bool stream = true;
-    if (data.contains("stream") && json_value(data, "stream", false) == false) {
-        SRV_WRN("%s", "requested \"stream\": false is not honored, this server always streams\n");
-    }
+    // honor the client's stream flag: non-stream requests get a plain JSON body
+    const bool stream = json_value(data, "stream", false);
 
     if (!stream) {
         // non-stream, wait for the results

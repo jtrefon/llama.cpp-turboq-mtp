@@ -1679,11 +1679,10 @@ void server_models_routes::init_routes() {
         std::string conv_id = server_stream_conv_id_from_headers(req.headers);
         uint64_t ticket = models.conv_models.remember(conv_id, name);
 
-        // generation endpoints stream on this server (the child forces streaming
-        // too). Return a streaming response immediately and emit model-load
-        // status events while the child spawns, so clients never sit in a
-        // silent wait (long loads used to trip client timeouts).
-        if (json_value(body, "stream", true)) {
+        // streaming requests return a streaming response immediately and emit
+        // model-load status events while the child spawns, so clients never sit
+        // in a silent wait (long loads used to trip client timeouts)
+        if (json_value(body, "stream", false)) {
             auto state = std::make_shared<router_proxy_stream_state>();
             state->self        = &models;
             state->name        = name;
