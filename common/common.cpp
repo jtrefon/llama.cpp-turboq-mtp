@@ -2125,21 +2125,42 @@ struct ckpt_staging_pool {
     std::mutex mtx;
 
     int acquire(size_t need) {
-        std::lock_guard<std::mutex> lk(mtx);
-        for (int i = 0; i < N; ++i) {
-            if (!busy[i]) {
-                if (cap[i] < need) {
-                    if (buf[i]) {
-                        cudaFreeHost(buf[i]);
-                    }
-                    cudaHostAlloc((void **)&buf[i], need, cudaHostAllocDefault);
-                    cap[i] = need;
+        // pick a free slot without holding the lock during CUDA calls:
+        // cudaFreeHost/cudaHostAlloc may wait on the per-thread stream, and the
+        // host callback (which also takes mtx in release()) must not block on it
+        int i = -1;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            for (int j = 0; j < N; ++j) {
+                if (!busy[j]) {
+                    busy[j] = true;
+                    i = j;
+                    break;
                 }
-                busy[i] = true;
-                return i;
             }
         }
-        return -1;
+        if (i < 0) {
+            return -1;
+        }
+        if (cap[i] < need) {
+            uint8_t * nb = nullptr;
+            if (cudaHostAlloc((void **) &nb, need, cudaHostAllocDefault) != cudaSuccess) {
+                std::lock_guard<std::mutex> lk(mtx);
+                busy[i] = false;
+                return -1;
+            }
+            uint8_t * ob;
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                ob = buf[i];
+                buf[i] = nb;
+                cap[i] = need;
+            }
+            if (ob) {
+                cudaFreeHost(ob);
+            }
+        }
+        return i;
     }
 
     void release(int i) {
@@ -2248,8 +2269,15 @@ void common_prompt_checkpoint::update_tgt(
         // both staging slots busy (should not happen in practice): drain and retry
         cudaStreamSynchronize(cudaStreamPerThread);
         slot = g_ckpt_staging.acquire(ckpt_size);
+        if (slot < 0) {
+            // staging unavailable (host memory pressure): fall back to a synchronous copy
+            const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+            if (n != ckpt_size) {
+                GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+            }
+            return;
+        }
     }
-    GGML_ASSERT(slot >= 0 && "ckpt staging pool exhausted");
 
     cudaEvent_t ev;
     const size_t n = llama_state_seq_get_data_ext_async(ctx, g_ckpt_staging.ptr(slot), ckpt_size, seq_id, flags, &ev);
@@ -2286,10 +2314,18 @@ void common_prompt_checkpoint::update_dft(
 #if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     int slot = g_ckpt_staging.acquire(ckpt_size);
     if (slot < 0) {
+        // both staging slots busy (should not happen in practice): drain and retry
         cudaStreamSynchronize(cudaStreamPerThread);
         slot = g_ckpt_staging.acquire(ckpt_size);
+        if (slot < 0) {
+            // staging unavailable (host memory pressure): fall back to a synchronous copy
+            const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+            if (n != ckpt_size) {
+                GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+            }
+            return;
+        }
     }
-    GGML_ASSERT(slot >= 0 && "ckpt staging pool exhausted");
 
     cudaEvent_t ev;
     const size_t n = llama_state_seq_get_data_ext_async(ctx, g_ckpt_staging.ptr(slot), ckpt_size, seq_id, flags, &ev);
