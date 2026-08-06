@@ -351,6 +351,8 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    uint64_t graph_vis_fingerprint() const override;
+
     //
     // llama_kv_cache_dsv4_context specific API
     //
