@@ -1573,7 +1573,11 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
 
     kv_raw->state_write(io, seq_id, flags);
 
-    if (!partial_only) {
+    // the compressed-state K caches are read by attention for the history
+    // beyond the raw SWA window: they must be part of the checkpoint even in
+    // partial (spec-loop) restores, otherwise the sequence's long-range
+    // memory goes stale and drifts from the raw KV
+    {
         const llama_pos pos_max = seq_id >= 0 ? kv_raw->seq_pos_max(seq_id) : -1;
 
         //FIXME : note that we conflate token positions with rows, which is not true for multi-modal case.
@@ -1621,11 +1625,7 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
 
     kv_raw->state_read(io, seq_id, flags);
 
-    if (!partial_only) {
-        kv_csa->clear(true);
-        kv_hca->clear(true);
-        kv_lid->clear(true);
-
+    {
         dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
@@ -2103,6 +2103,28 @@ const llama_ubatch & llama_kv_cache_dsv4_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return ubatches[i_next];
+}
+
+uint64_t llama_kv_cache_dsv4_context::graph_vis_fingerprint() const {
+    // the compressed-gather graph width (padded n_kv) grows with the context
+    // depth; a reused graph with stale gather sizes reads out of bounds
+    uint64_t n_kv_max = 0;
+
+    auto update = [&](const std::vector<comp_plan> & plans) {
+        for (const auto & plan : plans) {
+            n_kv_max = std::max(n_kv_max, (uint64_t) plan.n_kv);
+        }
+    };
+
+    update(plans_csa);
+    update(plans_hca);
+    update(plans_lid);
+
+    n_kv_max = std::max(n_kv_max, (uint64_t) reserve_plan_csa.n_kv);
+    n_kv_max = std::max(n_kv_max, (uint64_t) reserve_plan_hca.n_kv);
+    n_kv_max = std::max(n_kv_max, (uint64_t) reserve_plan_lid.n_kv);
+
+    return n_kv_max;
 }
 
 const llama_kv_cache_dsv4_raw_context * llama_kv_cache_dsv4_context::get_raw() const {
