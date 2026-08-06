@@ -731,6 +731,10 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // memory graph-topology fingerprint (see llama_memory_context_i): 0 unless
+    // the memory's graph width depends on the context depth (DSV4 compressed rows)
+    uint64_t mem_vis = 0;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -824,7 +828,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            mem_vis == other.mem_vis;
     }
 };
 
