@@ -2259,6 +2259,12 @@ void common_prompt_checkpoint::update_tgt(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
+    // the pending capture's host callback copies into data_tgt: resizing below
+    // could free that buffer while the callback is still writing to it
+    if (async_active_tgt && !copied_tgt.load(std::memory_order_acquire)) {
+        cudaStreamSynchronize(cudaStreamPerThread);
+    }
+
     data_tgt.resize(ckpt_size);
 
 #if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -2308,6 +2314,12 @@ void common_prompt_checkpoint::update_dft(
     }
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+
+    // the pending capture's host callback copies into data_dft: resizing below
+    // could free that buffer while the callback is still writing to it
+    if (async_active_dft && !copied_dft.load(std::memory_order_acquire)) {
+        cudaStreamSynchronize(cudaStreamPerThread);
+    }
 
     data_dft.resize(ckpt_size);
 
