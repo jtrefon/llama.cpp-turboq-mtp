@@ -558,6 +558,19 @@ task_params eval_llama_cmpl_schema(
             params.sampling.dry_penalty_last_n = n_ctx_slot;
         }
 
+        // the reasoning budget must never exceed a safe fraction of the total
+        // generation budget: otherwise a deepseek-format reasoner spends the
+        // whole request on thinking and produces no visible content (which
+        // clients like hermes treat as an empty response and retry/loop on)
+        if (params.sampling.reasoning_budget_tokens >= 0) {
+            const int32_t n_total = params.n_predict > 0 ? params.n_predict : INT32_MAX;
+            if (n_total != INT32_MAX) {
+                params.sampling.reasoning_budget_tokens = std::min(
+                    params.sampling.reasoning_budget_tokens,
+                    std::max(0, (int32_t) (n_total * 0.7f)));
+            }
+        }
+
         // if "reasoning_format" is not provided, its handler will not be called, we will need to handle it here
         auto reasoning_format = params.chat_parser_params.reasoning_format;
         params.chat_parser_params.reasoning_in_content = params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);

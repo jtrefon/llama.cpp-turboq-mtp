@@ -1154,8 +1154,12 @@ private:
                 auto cparams_dft = common_context_params_to_llama(params_dft);
                 if (spec_mtp) {
                     cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                    // must match the real MTP context (common/speculative.cpp):
+                    // keep the same recurrent-state rollback depth as the target
+                    cparams_dft.n_rs_seq = (uint32_t) std::max(1, params_base.speculative.draft.n_max);
+                } else {
+                    cparams_dft.n_rs_seq = 0;
                 }
-                cparams_dft.n_rs_seq = 0;
 
                 std::vector<ggml_backend_dev_t> devs;
                 uint32_t hp_ngl = 0;
@@ -2441,6 +2445,24 @@ private:
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
+        // Re-sync the MTP shadow context to the target's real frontier.
+        // After a context reload (e.g. a new request reusing the slot), the target
+        // is re-prefilled from position 0 while ctx_mtp may still hold stale KV
+        // ahead of the new frontier. The streaming hook skips mirroring whenever
+        // pos_start <= pos_max_mtp, so a stale ctx_mtp tail is never corrected and
+        // the draft head desyncs from the target (acceptance collapses / loops).
+        // Trimming ctx_mtp back to the target frontier here guarantees the hook
+        // rebuilds it from the correct hidden states on the next decode.
+        // llama_context_seq_rm mirrors the trim onto ctx_mtp automatically.
+        {
+            const llama_pos pos_max_mtp = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+            if (pos_max_mtp > pos_max) {
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, pos_max + 1, -1);
+                SLT_DBG(slot, "mtp resync: trimmed stale ctx_mtp tail from %d to frontier %d\n",
+                        (int) pos_max_mtp, (int) pos_max);
+            }
+        }
+
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
@@ -3052,7 +3074,7 @@ private:
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
-                    send_error(slot, "context shift is disabled", ERROR_TYPE_SERVER);
+                    send_error(slot, string_format("request exceeds the available context size (%d tokens), try increasing it", slot.n_ctx), ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                     slot.release();
                     return;
                 }

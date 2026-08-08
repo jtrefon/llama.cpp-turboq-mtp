@@ -1104,6 +1104,10 @@ json oaicompat_chat_params_parse(
         else if        (reasoning_effort == "medium")                                 effort_budget = 4096;
         else if        (reasoning_effort == "high")                                   effort_budget = 8192;
         else if        (reasoning_effort == "max")                                    effort_budget = 16384;
+        // hermes and other clients send xhigh/ultra; treat them as bounded
+        // extensions of the ladder instead of falling through to unlimited
+        else if        (reasoning_effort == "xhigh")                                  effort_budget = 24576;
+        else if        (reasoning_effort == "ultra")                                  effort_budget = 32768;
     }
 
     inputs.force_pure_content = opt.force_pure_content;
@@ -1132,9 +1136,12 @@ json oaicompat_chat_params_parse(
             for (const auto & part : msg.content_parts) {
                 chars += part.text.size();
             }
+            for (const auto & tc : msg.tool_calls) {
+                chars += tc.name.size() + tc.arguments.size() + tc.id.size() + 20;
+            }
             // Template overhead: ~5 tokens per message for markers + role text
-            // Content: ~3 chars per token (conservative estimate)
-            return chars / 3 + 5;
+            // Content: ~2 chars per token (conservative; JSON/tool syntax is 1-2 chars/token)
+            return chars / 2 + 5;
         };
 
         size_t total = 0;
