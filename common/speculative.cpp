@@ -1277,6 +1277,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // The last h-row of one process() call needs the first token of the NEXT
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
+    std::vector<llama_pos>          pending_pos_last; // last target pos mirrored into ctx_dft
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1288,6 +1289,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
+
+    // Loop breaker: when every MTP draft is accepted for N consecutive rounds,
+    // the model is likely stuck in a repetitive pattern (e.g. tool-call loop).
+    // Force a single-sample round (no drafts) so EOS can surface.
+    static constexpr int32_t FULL_ACCEPT_LIMIT = 60;
+    std::vector<int32_t> full_accept_streak;
+    std::vector<int32_t> last_n_drafted;
+    std::vector<bool>    force_single_sample;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
@@ -1359,6 +1368,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        pending_pos_last.assign(n_seq, -1);
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1366,6 +1376,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        full_accept_streak.assign(n_seq, 0);
+        last_n_drafted.assign(n_seq, 0);
+        force_single_sample.assign(n_seq, false);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1392,6 +1406,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
+        }
+
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            full_accept_streak[seq_id] = 0;
+            last_n_drafted[seq_id]     = 0;
+            force_single_sample[seq_id] = false;
+
+            // after a checkpoint restore / context reload the target's hidden
+            // state at the reuse position differs from the previous request's
+            // tail, so a stale pending_h would seed the draft ctx wrongly and
+            // desync the draft head (acceptance collapses to 0). Reset it so
+            // the first process() call re-derives it from the target.
+            std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+            pending_pos_last[seq_id] = -1;
         }
 
         auto * ctx_dft = this->params.ctx_dft;
@@ -1432,6 +1460,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         i_batch_beg[seq_id] = k;
                     }
                 }
+            }
+        }
+
+        // detect a position discontinuity (cache reuse / checkpoint restore
+        // rewinds the target while ctx_dft still mirrors the pre-rewind tail):
+        // the stale pending_h would seed the draft ctx at the wrong position
+        // and desync the draft head (acceptance collapses to ~0). Reset it so
+        // the catch-up decode below re-derives it from the target.
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_batch_beg[seq_id] < 0) {
+                continue;
+            }
+            const llama_pos pos_beg = batch_in.pos[i_batch_beg[seq_id]];
+            if (pending_pos_last[seq_id] >= 0 && pos_beg != pending_pos_last[seq_id] + 1) {
+                std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+                pending_pos_last[seq_id] = -1;
             }
         }
 
@@ -1519,6 +1563,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            pending_pos_last[seq_id] = batch_in.pos[i_batch_end[seq_id]];
         }
 
         return true;
@@ -1539,6 +1584,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             auto & dp = dparams[seq_id];
 
             if (!dp.drafting) {
+                continue;
+            }
+
+            if (force_single_sample[seq_id]) {
+                // Loop breaker fired: skip this round so the target samples
+                // without MTP influence (lets EOS surface).
+                force_single_sample[seq_id] = false;
+                last_n_drafted[seq_id] = 0;
                 continue;
             }
 
@@ -1671,13 +1724,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                last_n_drafted[seq_id] = 0;
+            } else {
+                // match the server-side truncation (common_speculative_draft) so the
+                // breaker compares against the draft length actually verified
+                int32_t n_drafted = (int32_t) dp.result->size();
+                if (dp.n_max > 0) {
+                    n_drafted = std::min(n_drafted, dp.n_max);
+                }
+                last_n_drafted[seq_id] = n_drafted;
             }
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        const int32_t n_drafted_last = last_n_drafted[seq_id];
+        if (n_drafted_last > 0 && !is_other) {
+            // Loop breaker: detect repetitive full-accept (all drafts accepted)
+            if (n_accepted > 0 && n_accepted >= (uint16_t) n_drafted_last) {
+                if (++full_accept_streak[seq_id] >= FULL_ACCEPT_LIMIT) {
+                    LOG_INF("%s: seq %d full-accept streak=%d - forcing single-sample round\n",
+                            __func__, (int) seq_id, full_accept_streak[seq_id]);
+                    force_single_sample[seq_id] = true;
+                    full_accept_streak[seq_id] = 0;
+                }
+            } else {
+                full_accept_streak[seq_id] = 0;
+            }
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
@@ -1688,6 +1765,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    // serialize the hidden-state carry (pending_h) with the checkpoint so a
+    // checkpoint restore can re-seed the draft ctx from the exact position the
+    // restored KV covers, instead of a stale/zeroed embedding (which desyncs
+    // the draft head: acceptance collapses to ~0)
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pending_pos_last[seq_id] < 0) {
+            return false;
+        }
+
+        const llama_pos pos = pending_pos_last[seq_id];
+        data.resize(sizeof(llama_pos) + pending_h[seq_id].size() * sizeof(float));
+        std::memcpy(data.data(),                     &pos,                     sizeof(llama_pos));
+        std::memcpy(data.data() + sizeof(llama_pos), pending_h[seq_id].data(), pending_h[seq_id].size() * sizeof(float));
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        const size_t expect = sizeof(llama_pos) + (size_t) n_embd * sizeof(float);
+        if (data.size() != expect) {
+            return;
+        }
+
+        llama_pos pos = -1;
+        std::memcpy(&pos, data.data(), sizeof(llama_pos));
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd * sizeof(float));
+        pending_pos_last[seq_id] = pos;
     }
 
     bool need_embd() const override {
@@ -2328,11 +2436,15 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        // The MTP shadow context MUST keep the same recurrent-state rollback
+        // depth as the target. When a drafted token is rejected, seq_rm drops
+        // the KV rows but cannot roll back the recurrent 'S' state with
+        // n_rs_seq == 0, so the draft head drifts and eventually emits a fixed
+        // token forever (the high-context acceptance loop).
+        cparams.n_rs_seq  = (uint32_t) std::max(1, params.speculative.draft.n_max);
+    } else {
+        cparams.n_rs_seq  = 0;
     }
-
-    // note: for small models maybe we can set this to the maximum possible draft from all speculative types
-    //       the extra memory for small models is likely negligible?
-    cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
     std::string model_path;
