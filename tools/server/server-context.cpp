@@ -1458,7 +1458,6 @@ private:
             auto model_path = std::filesystem::path(params_base.model.path);
             model_name = model_path.filename().string();
         }
-
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
 
@@ -2835,7 +2834,13 @@ private:
 
                     // build the target params from pristine server defaults + preset
                     common_params params_swapped = params_original;
+                    // the auto-added alias (server.cpp) came from the OLD model's
+                    // path; clear it so the swapped model's name/preset alias wins
+                    params_swapped.model_alias.clear();
                     it->second.apply_to_params(params_swapped);
+                    if (params_swapped.model_alias.empty() && !params_swapped.model.get_name().empty()) {
+                        params_swapped.model_alias.insert(params_swapped.model.get_name());
+                    }
 
                     common_params params_prev = params_base;
 
