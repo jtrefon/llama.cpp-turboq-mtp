@@ -43,52 +43,63 @@ recover context. Update it on every merge batch.
 | `c745be2a2` | opencl: ref_count fix (#26162) | not used |
 | `11924d4c1` | test: fix CI errors (#26415) | |
 
-### Batch 2 - planned (see Pending below)
+### Batch 2 - merged 2026-08-09 (15 commits, all verified)
 
-## Pending - merge candidates (2026-08-09)
+| Upstream commit | Subject | Merged | Verified |
+|---|---|---|---|
+| `9a688e51e` | fit: Fix memory allocation for MTP layers (#26605) | yes | swap+MTP ok |
+| `69bf64379` | CUDA: fix thread/block count in quantized cpy kernel launches (#26731) | yes | build ok |
+| `9bd4c09ea` | CUDA: fix SMEM data-races in block_reduce (norm/softmax) (#26385) | yes | build ok |
+| `1269cb1ff` | model: allow reshape of tensors during load (#26531) | yes | build ok |
+| `3db4ff877` | model-loader: fix quantized reshaped tensor strides (#26672) | yes | build ok |
+| `7bd8282c3` | speculative: refactor common_speculative_init (#26510) | yes | MTP ok |
+| `a035a8887` | server: spec-decode counters on /metrics (#26389) | yes | build ok |
+| `96278e39f` | CUDA: backend sampler for penalties sampler (#25262) | yes | swap ok |
+| `935cad649` | llama: move n_vocab to penalty_sampler (#26520) | yes | swap ok |
+| `a6aa6f545` | sampler: remove "full-context windows" from history samplers (#26524) | yes | swap ok |
+| `f2b52a87e` | server: (tools) add x-tool-cwd header (#26420) | yes | build ok |
+| `99111b19c` | server: add get_info tool (#26522) | yes | build ok |
+| `2f56fc343` | ui: CWD for agent (#26518) | yes | build ok |
+| `4308a4f03` | server: decode Windows OEM output to UTF-8 in built-in tools (#26597) | yes | build ok |
+| `f9e832c10` | server: harden file_glob_search directory walk (#26626) | yes | build ok |
 
-### Must merge - bug fixes that hit us directly
+Notes: sampler chain applied in upstream order (96278e39f -> 935cad649 ->
+a6aa6f545); conflicts were pure line drift, resolved by taking upstream hunks
+and keeping our reasoning-budget clamp in server-schema.cpp. server-tools
+commits applied as a chain (we never modified that file).
 
-| Upstream commit | Subject | Applies? | Merged | Verified |
-|---|---|---|---|---|
-| `9a688e51e` | fit: Fix memory allocation for MTP layers (#26605) | clean | | |
-| `69bf64379` | CUDA: fix thread/block count in quantized cpy kernel launches (#26731) | clean | | |
-| `9bd4c09ea` | CUDA: fix SMEM data-races in block_reduce (norm/softmax) (#26385) | clean | | |
-| `1269cb1ff` | model: allow reshape of tensors during load (#26531) | clean | | |
+## Pending - remaining candidates
 
-### Should merge - maintenance value
-
-| Upstream commit | Subject | Applies? | Merged | Verified |
-|---|---|---|---|---|
-| `7bd8282c3` | speculative: refactor common_speculative_init (#26510) | clean | | |
-| `a035a8887` | server: spec-decode counters on /metrics (#26389) | clean | | |
-| `935cad649` | llama: move n_vocab to penalty_sampler (#26520) | CONFLICT (drift) | | |
-| `a6aa6f545` | sampler: remove "full-context windows" from history samplers (#26524) | CONFLICT (drift) | | |
-
-### Optional
-
-| Upstream commit | Subject | Applies? | Merged | Verified |
-|---|---|---|---|---|
-| `3db4ff877` | model-loader: fix quantized reshaped tensor strides (#26672) | CONFLICT (our DSpark mapping) | | |
-| `f9e832c10` | server: harden file_glob_search directory walk (#26626) | CONFLICT (drift) | | |
-| `96278e39f` | CUDA: backend sampler for penalties sampler (#25262) | clean, large | | |
+| Upstream commit | Subject | Applies? | Decision |
+|---|---|---|---|
+| `dd2c7c447` | server: docker tool isolation (#26507) | CONFLICT | SKIP - new subsystem, not a fix |
+| `18f7ad7fc` | server, ui: working dir only when a tool reads it (#26762) | CONFLICT | SKIP - depends on isolation |
+| `7ba604f1c` | server: report isolate working directory (#26773) | clean | SKIP - depends on isolation |
+| `0b14b87d7` | server: port 8080 -> 9931 notice (#26508) | clean | SKIP - we pin 8081 |
 
 ### Skipped - not relevant
 
 SYCL / Vulkan / Metal / WebGPU, mtmd / OCR / TTS, UI / webui, CI, convert
 scripts, vendor bumps (BoringSSL, cpp-httplib), ggml version bumps, grammar,
-security docs, tests. Full list: 87 of the 98 missing commits.
-`0b14b87d7` (upstream default port 8080 -> 9931 notice) skipped - we pin 8081.
+security docs, tests. 87 of the 98 originally-missing commits; the remainder
+are tracked above (4 isolation/port commits).
 
 ## Conflict resolution notes
 
 - `935cad649` / `a6aa6f545`: sampler refactors; our only sampler additions are
   ftype enums (`LLAMA_FTYPE_MOSTLY_TBQ3_0/TBQ4_0`) + unrelated API, no semantic
-  overlap - conflicts are pure line drift, resolve by taking upstream hunks.
+  overlap - conflicts were pure line drift, resolved by taking upstream hunks.
+  NOTE: `96278e39f` (CUDA backend sampler) must be applied FIRST - it is a
+  prerequisite for `935cad649` (n_vocab lives in the sampler struct upstream).
+  Keep our reasoning-budget clamp in server-schema.cpp when resolving
+  `a6aa6f545` (upstream deletes the `-1 -> ctx-size` fallback there; samplers
+  now clamp `-1 -> 0` at init).
 - `3db4ff877`: upstream strides fix collides with our `llama_model_loader_apply_dspark_mapping`
-  (180 added lines in llama-model-loader.cpp) - line shift only.
-- `f9e832c10`: we did NOT modify server-tools.cpp; conflict is upstream drift
-  in surrounding code.
+  (180 added lines in llama-model-loader.cpp) - line shift only; apply AFTER
+  `1269cb1ff` (reshape commit) and it applies cleanly.
+- `f9e832c10`: we did NOT modify server-tools.cpp; apply the 5-commit tool
+  chain (f2b52a87e -> 99111b19c -> 2f56fc343 -> 4308a4f03 -> f9e832c10) in
+  order instead of cherry-picking the last commit alone.
 
 ## Fork-local changes to re-verify after any sync
 
@@ -107,4 +118,5 @@ security docs, tests. Full list: 87 of the 98 missing commits.
 | Date | From | Commits | Result |
 |---|---|---|---|
 | 2026-08-02 | upstream (absorb) | 13 | in HEAD |
-| (pending) | upstream | 4 must + 4 should + 3 optional | |
+| 2026-08-09 | upstream | 15 | merged, build + swap + MTP verified, pushed e0858931d |
+| 2026-08-09 | borrow source (origin) | 0 | fully contained, nothing to merge |
