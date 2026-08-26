@@ -159,7 +159,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.source.outputs.tag }}
-          name: llama-turboq ${{ needs.source.outputs.tag }}${{ github.event_name == 'workflow_dispatch' && inputs.prod_mark == 'true' || github.event_name == 'push' && ' (PROD)' || '' }}
+          name: llama-turboq ${{ needs.source.outputs.tag }}${{ (github.event_name == 'workflow_dispatch' && inputs.prod_mark == 'true' || github.event_name == 'push') && ' (PROD)' || '' }}
           make_latest: ${{ github.event_name == 'workflow_dispatch' && inputs.prod_mark == 'true' || github.event_name == 'push' }}
           prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prod_mark == 'false' }}
           body: |
