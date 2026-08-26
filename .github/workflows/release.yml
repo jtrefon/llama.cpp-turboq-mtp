@@ -6,13 +6,13 @@ on:
       create_release:
         description: 'Create new release'
         required: true
-        type: boolean
-        default: true
+        type: string
+        default: 'true'
       prod_mark:
         description: 'Mark release as production (GitHub Latest)'
         required: true
-        type: boolean
-        default: true
+        type: string
+        default: 'true'
       tag:
         description: 'Release tag (e.g. v1.0.0)'
         required: true
@@ -47,7 +47,7 @@ jobs:
       - name: Create source archive
         run: |
           git archive --format=tar.gz -o llama-turboq-${{ steps.tag.outputs.name }}-source.tar.gz \
-            --prefix=llama-turboq-${{ steps.tag.outputs.name }}/ HEAD
+            --prefix=llama-turboq-${{ steps.tag.outputs.name }}/ ${{ steps.tag.outputs.name }}
 
       - uses: actions/upload-artifact@v4
         with:
