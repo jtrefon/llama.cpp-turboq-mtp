@@ -243,6 +243,8 @@ struct server_slot {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    bool is_mtp_enabled = false;
+
     common_memory mem;
 
     // multimodal
@@ -435,6 +437,8 @@ struct server_slot {
         GGML_ASSERT(task);
         return task->need_embd();
     }
+
+    bool is_mtp() const { return is_mtp_enabled; }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
     // also we cannot split if the pooling would require any past tokens
@@ -854,9 +858,37 @@ public:
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
 
+    // model swap registry, populated from params_base.models_preset (INI file) in init()
+    common_preset_context ctx_preset;
+    common_presets model_presets; // keyed by preset section name
+    common_preset global_preset;  // [global] section, cascaded into every preset
+
+    // invoked (on the main loop thread) after a model swap completes
+    // used to refresh server_routes::meta
+    std::function<void()> callback_on_model_swapped;
+
+    // resolve a model name (preset section key or one of its LLAMA_ARG_ALIAS
+    // entries) to the preset key; returns "" if not found
+    std::string resolve_preset_key(const std::string & name) const {
+        if (model_presets.count(name)) {
+            return name;
+        }
+        std::string aliases;
+        for (const auto & [key, preset] : model_presets) {
+            if (preset.get_option("LLAMA_ARG_ALIAS", aliases)) {
+                for (const auto & alias : string_split<std::string>(aliases, ',')) {
+                    if (alias == name) {
+                        return key;
+                    }
+                }
+            }
+        }
+        return "";
+    }
+
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
-    server_context_impl() {
+    server_context_impl() : ctx_preset(LLAMA_EXAMPLE_SERVER) {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
     }
 
@@ -1526,6 +1558,7 @@ private:
                 /* media_path            */ params_base.media_path,
                 /* force_pure_content    */ params_base.force_pure_content_parser
             };
+            chat_params.vocab = vocab;
 
             {
                 auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
@@ -1578,6 +1611,7 @@ private:
             /* tmpls                 */ std::move(chat_templates),
             /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
             /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
+            /* allow_video           */ mctx ? mtmd_helper_support_video(mctx) : false,
             /* enable_thinking       */ enable_thinking,
             /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
             /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
@@ -1585,6 +1619,7 @@ private:
             /* force_pure_content    */ params_base.force_pure_content_parser,
             /* n_ctx                 */ params_base.n_ctx
         };
+        chat_params.vocab = vocab;
 
         return true;
     }
@@ -2820,8 +2855,13 @@ private:
                         break;
                     }
 
-                    // build the target params from pristine server defaults + preset
+                    // build the target params from the startup CLI params + preset.
+                    // reset identity fields first: the --alias / --model-tag handlers
+                    // insert (they do not replace), so without this the previous model's
+                    // names stay attached and model_name resolves to the wrong entry
                     common_params params_swapped = params_original;
+                    params_swapped.model_alias.clear();
+                    params_swapped.model_tags.clear();
                     it->second.apply_to_params(params_swapped);
 
                     common_params params_prev = params_base;
@@ -3379,9 +3419,9 @@ private:
                                            string_format("accumulated context (%d tokens) is full — cannot process "
                                                          "more tokens (max %d)",
                                                          (int)slot.prompt.tokens.pos_next(), slot.n_ctx),
-                                           ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                                            ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
-                                continue;
+                                return;
                             }
 
                             if (slot.task->params.cache_prompt) {
@@ -4772,6 +4812,48 @@ static json get_res_models(const server_context_meta & meta) {
     };
 }
 
+// like get_res_models(), but also advertises the models in the preset registry
+// (available via POST /models/load) so clients can discover swap targets
+static json get_res_models_ext(const server_context_meta & meta, const common_presets & presets) {
+    json res = get_res_models(meta);
+
+    json data = res["data"]; // [ loaded model ]
+    data[0]["status"] = "loaded";
+    data[0]["loaded"] = true;
+
+    for (const auto & [name, preset] : presets) {
+        std::string model_path;
+        std::string aliases;
+        std::string n_ctx_str;
+        preset.get_option("LLAMA_ARG_MODEL",    model_path);
+        preset.get_option("LLAMA_ARG_ALIAS",    aliases);
+        preset.get_option("LLAMA_ARG_CTX_SIZE", n_ctx_str);
+
+        const bool is_loaded = meta.model_aliases.count(name) != 0
+                            || (!model_path.empty() && meta.model_path == model_path);
+
+        data.push_back({
+            {"id",       name},
+            {"model",    name},
+            {"aliases",  aliases},
+            {"object",   "model"},
+            {"owned_by", "llamacpp"},
+            {"created",  std::time(0)},
+            {"status",   is_loaded ? "loaded" : "unloaded"},
+            {"loaded",   is_loaded},
+            // configured context window; the slot window may be capped on load
+            {"context_length", n_ctx_str.empty() ? 0 : std::stoi(n_ctx_str)},
+            {"details", {
+                {"format",     "gguf"},
+                {"model_path", model_path},
+            }},
+        });
+    }
+
+    res["data"] = data;
+    return res;
+}
+
 static json get_res_props(const server_context_meta & meta, const common_params & params, bool is_sleeping) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
@@ -5284,7 +5366,7 @@ void server_routes::init_routes() {
             std::unique_lock<std::mutex> lock(mutex_cache);
             res->ok(cached_models);
         } else {
-            res->ok(get_res_models(*meta));
+            res->ok(get_res_models_ext(*meta, this->ctx_server.model_presets));
         }
         return res;
     };
@@ -5533,25 +5615,36 @@ void server_routes::init_routes() {
     };
 }
 
-json server_routes::get_model_info() const {
+json server_routes::swap_model_if_requested(const server_http_req & req, server_response_reader & rd, const std::string & name) {
+    const std::string key = this->ctx_server.resolve_preset_key(name);
+    // not a registered preset (or alias) -> leave it to the current model
+    if (key.empty()) {
+        return json();
+    }
+
+    // already loaded -> no-op
     auto meta = get_meta();
-    return json {
-        {"id",       meta->model_name},
-        {"aliases",  meta->model_aliases},
-        {"tags",     meta->model_tags},
-        {"object",   "model"},
-        {"created",  std::time(0)},
-        {"owned_by", "llamacpp"},
-        {"meta",     {
-            {"vocab_type",  meta->model_vocab_type},
-            {"n_vocab",     meta->model_vocab_n_tokens},
-            {"n_ctx",       meta->slot_n_ctx},
-            {"n_ctx_train", meta->model_n_ctx_train},
-            {"n_embd",      meta->model_n_embd_inp},
-            {"n_params",    meta->model_n_params},
-            {"size",        meta->model_size},
-        }},
-    };
+    std::string preset_path;
+    this->ctx_server.model_presets.at(key).get_option("LLAMA_ARG_MODEL", preset_path);
+    if (meta->model_aliases.count(name) != 0 || (!preset_path.empty() && meta->model_path == preset_path)) {
+        return json();
+    }
+
+    server_task task(SERVER_TASK_TYPE_MODEL_SWAP);
+    task.id         = rd.get_new_id();
+    task.model_name = name;
+    rd.post_task(std::move(task), true); // high priority
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        // connection was closed mid-swap
+        return format_error_response("connection closed during model swap", ERROR_TYPE_SERVER);
+    }
+    if (result->is_error()) {
+        return result->to_json();
+    }
+
+    return json();
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot) {
@@ -5809,7 +5902,7 @@ void server_routes::update_cached_responses(bool is_sleeping) {
     std::unique_lock<std::mutex> lock(mutex_cache);
 
     if (is_sleeping) {
-        cached_models  = get_res_models(*meta);
+        cached_models  = get_res_models_ext(*meta, ctx_server.model_presets);
         cached_props   = get_res_props(*meta, params, true);
         cached_metrics = ctx_server.get_metrics();
 

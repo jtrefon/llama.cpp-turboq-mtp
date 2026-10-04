@@ -15,6 +15,30 @@
 #include <limits>
 #include <cstring>
 #include <type_traits>
+#include <algorithm>
+#include <cctype>
+
+// Map a reasoning-effort WORD (OpenAI-compatible `reasoning_effort`) to a token budget.
+// Returns true if the word is recognized (budget set); false if unrecognized (caller
+// falls back to the config default). Budget values:
+//   0    = thinking disabled (immediate end)
+//   N>0  = token budget
+//   -1   = unlimited (the top level)
+// Ladder: none/off=off  minimal=512  low=1024  medium=2048  high=4096  xhigh=8192  max/ultra/unlimited=unlimited
+static bool reasoning_effort_to_budget(const std::string & word, int & budget) {
+    std::string w = word;
+    std::transform(w.begin(), w.end(), w.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+    if (w.empty())                          return false;
+    if (w == "none" || w == "off")          { budget = 0;    return true; }
+    if (w == "minimal")                     { budget = 512;  return true; }
+    if (w == "low")                         { budget = 1024; return true; }
+    if (w == "medium")                      { budget = 2048; return true; }
+    if (w == "high")                        { budget = 4096; return true; }
+    if (w == "xhigh")                       { budget = 8192; return true; }
+    if (w == "max" || w == "ultra" ||
+        w == "unlimited")                   { budget = -1;   return true; }
+    return false;                            // unrecognized -> config fallback
+}
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -1320,14 +1344,16 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
-    // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
+    // Parse the OAI "reasoning_effort" field; "none"/"off" disables reasoning.
+    // NOTE: the word is intentionally NOT forwarded into the chat template: model
+    // templates validate the value (e.g. Qwen3.8 accepts only low/medium/xhigh)
+    // and raise on OpenAI-style words (high/max/...). The word is instead mapped
+    // to a hard token budget in the reasoning-budget block below.
     if (body.contains("reasoning_effort")) {
-        auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
-        if (reasoning_effort == "none") {
+        std::string e = json_value(body, "reasoning_effort", std::string(""));
+        std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+        if (e == "none" || e == "off") {
             inputs.enable_thinking = false;
-            inputs.chat_template_kwargs.erase("reasoning_effort");
-        } else if (!reasoning_effort.empty()) {
-            inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
         }
     }
 
@@ -1350,19 +1376,28 @@ json oaicompat_chat_params_parse(
                 std::max<size_t>(1, opt.n_ctx) / 4);
         const size_t budget = std::max<size_t>(1, opt.n_ctx) - margin;
 
-        auto estimate_msg_tokens = [](const common_chat_msg & msg) -> size_t {
-            size_t chars = 0;
-            chars += msg.content.size();
-            chars += msg.reasoning_content.size();
+        auto estimate_msg_tokens = [vocab = opt.vocab](const common_chat_msg & msg) -> size_t {
+            std::string text;
+            text += msg.content;
+            text += msg.reasoning_content;
             for (const auto & part : msg.content_parts) {
-                chars += part.text.size();
+                text += part.text;
             }
             for (const auto & tc : msg.tool_calls) {
-                chars += tc.name.size() + tc.arguments.size() + tc.id.size() + 20;
+                text += tc.name;
+                text += tc.arguments;
+                text += tc.id;
             }
-            // Template overhead: ~5 tokens per message for markers + role text
-            // Content: ~2 chars per token (conservative; JSON/tool syntax is 1-2 chars/token)
-            return chars / 2 + 5;
+            size_t n;
+            if (vocab != nullptr && !text.empty()) {
+                // exact token count (no special tokens added)
+                const int32_t k = llama_tokenize(vocab, text.data(), (int32_t) text.size(), nullptr, 0, false, false);
+                n = k < 0 ? (size_t) (-k) : (size_t) k;
+            } else {
+                // fallback heuristic when no tokenizer is available
+                n = text.size() / 2;
+            }
+            return n + 5; // + template overhead (~5 tokens per message for markers + role text)
         };
 
         size_t total = 0;
@@ -1459,12 +1494,30 @@ json oaicompat_chat_params_parse(
 
     llama_params["message_delimiters"] = chat_params.message_delimiters.to_json();
 
-    // Reasoning budget: pass parameters through to sampling layer
+    // Reasoning budget: pass parameters through to sampling layer.
+    // Precedence (highest wins):
+    //   1. raw per-request number  (thinking_budget_tokens / reasoning_budget_tokens)
+    //   2. reasoning_effort WORD   (mapped via reasoning_effort_to_budget)
+    //   3. server config default   (opt.reasoning_budget, from models.ini / --reasoning-budget)
+    // A request always overrides config; config is the fallback when no field is sent.
     {
-        int reasoning_budget = json_value(body, "reasoning_budget_tokens",
-                               json_value(body, "thinking_budget_tokens", -1));
-        if (reasoning_budget == -1) {
-            reasoning_budget = opt.reasoning_budget;
+        int reasoning_budget = opt.reasoning_budget;   // 3: config default (fallback)
+
+        // 2: reasoning_effort word (OpenAI-compatible top-level field)
+        if (body.contains("reasoning_effort")) {
+            const std::string effort = json_value(body, "reasoning_effort", std::string(""));
+            int word_budget = 0;
+            if (reasoning_effort_to_budget(effort, word_budget)) {
+                reasoning_budget = word_budget;
+            }
+        }
+
+        // 1: raw per-request number (highest priority; -1 = unlimited, 0 = immediate end)
+        if (body.contains("thinking_budget_tokens")) {
+            reasoning_budget = json_value(body, "thinking_budget_tokens", reasoning_budget);
+        }
+        if (body.contains("reasoning_budget_tokens")) {
+            reasoning_budget = json_value(body, "reasoning_budget_tokens", reasoning_budget);
         }
 
         if (!chat_params.thinking_end_tags.empty()) {
