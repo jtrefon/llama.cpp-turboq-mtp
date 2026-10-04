@@ -5380,6 +5380,14 @@ static bool validate_e_e8m0(uint8_t e, size_t i) {
         } \
     }
 
+#define VALIDATE_ROW_DATA_D2_F16_IMPL(type, data, nb) \
+    const type * q = (const type *) (data); \
+    for (size_t i = 0; i < (nb); ++i) { \
+        if (!validate_fp16(q[i].d0, i) || !validate_fp16(q[i].d1, i)) { \
+            return false; \
+        } \
+    }
+
 #define VALIDATE_ROW_DATA_DM_F16_IMPL(type, data, nb, d, m) \
     const type * q = (const type *) (data); \
     for (size_t i = 0; i < (nb); ++i) { \
@@ -5657,6 +5665,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TBQ4_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tbq4_0, data, nb);
+            } break;
+        case GGML_TYPE_TQ4_1S:
+            {
+                VALIDATE_ROW_DATA_D2_F16_IMPL(block_tq4_1s, data, nb);
             } break;
 
         case GGML_TYPE_I8:

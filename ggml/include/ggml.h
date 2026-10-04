@@ -436,7 +436,8 @@ extern "C" {
         GGML_TYPE_ISO3_0    = 46, // IsoQuant 3-bit: quaternion 4D + 2-bit + 1-bit QJL
         GGML_TYPE_PLANAR4_0 = 47, // PlanarQuant 4-bit: 2D Givens + 4-bit nibble
         GGML_TYPE_ISO4_0    = 48, // IsoQuant 4-bit: quaternion 4D + 4-bit nibble
-        GGML_TYPE_COUNT   = 49,
+        GGML_TYPE_TQ4_1S    = 49, // WHT-rotated 4-bit weights (5.0 bpw, dual-scale)
+        GGML_TYPE_COUNT   = 50,
     };
 
     // precision
@@ -483,6 +484,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_TBQ3_0  = 29, // except 1d tensors
         GGML_FTYPE_MOSTLY_TBQ4_0  = 30, // except 1d tensors
+        GGML_FTYPE_MOSTLY_TQ4_1S  = 31, // except 1d tensors
     };
 
     // available tensor operations:

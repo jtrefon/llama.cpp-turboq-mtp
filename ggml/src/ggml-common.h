@@ -305,6 +305,16 @@ typedef struct {
 } block_tbq4_0;
 static_assert(sizeof(block_tbq4_0) == sizeof(ggml_half) + QK_TBQ4 / 2, "wrong tbq4_0 block size/padding");
 
+// TQ4_1S: WHT-rotated 4-bit weight quantization (16-level Lloyd-Max for N(0,1))
+// Block 32 values, dual half-block scales; 20 bytes -> 5.0 bpw
+#define QK_TQ4_1S 32
+typedef struct {
+    ggml_half d0;                     // scale for [0..15]
+    ggml_half d1;                     // scale for [16..31]
+    uint8_t   qs[QK_TQ4_1S / 2];      // 4-bit indices, nibble packed
+} block_tq4_1s;
+static_assert(sizeof(block_tq4_1s) == 20, "wrong tq4_1s block size");
+
 // PlanarQuant 3-bit: 2D Givens rotation + 2-bit scalar + 1-bit QJL
 // 50 bytes per 128 values = 3.125 bits/value
 #define QK_PLANAR3 128

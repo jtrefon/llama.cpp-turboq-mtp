@@ -46,6 +46,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "IQ1_S",    LLAMA_FTYPE_MOSTLY_IQ1_S,    " 1.56 bpw quantization",            },
     { "IQ1_M",    LLAMA_FTYPE_MOSTLY_IQ1_M,    " 1.75 bpw quantization",            },
     { "TQ1_0",    LLAMA_FTYPE_MOSTLY_TQ1_0,    " 1.69 bpw ternarization",           },
+    { "TQ4_1S",   LLAMA_FTYPE_MOSTLY_TQ4_1S,   " 5.00 bpw WHT-rotated (TurboQuant+)", },
     { "TQ2_0",    LLAMA_FTYPE_MOSTLY_TQ2_0,    " 2.06 bpw ternarization",           },
     { "TBQ3_0",   LLAMA_FTYPE_MOSTLY_TBQ3_0,   " 3.06 bpw TurboQuant",              },
     { "TBQ4_0",   LLAMA_FTYPE_MOSTLY_TBQ4_0,   " 4.06 bpw TurboQuant",              },
