@@ -128,6 +128,12 @@ void quantize_row_tbq4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
     quantize_row_tbq4_0_ref(x, y, k);
 }
 
+void quantize_row_tq4_1s(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TQ4_1S == 0);
+    block_tq4_1s * GGML_RESTRICT y = vy;
+    quantize_row_tq4_1s_ref(x, y, k);
+}
+
 //===================================== Q8_K ==============================================
 
 void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
@@ -1425,4 +1431,26 @@ void quantize_row_iq4_nl(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
 void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
+}
+
+// TQ4_1S: reference matvec via per-block dequantization (TurboQuant+ spike)
+void ggml_vec_dot_tq4_1s_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs);
+    GGML_ASSERT(n % QK_TQ4_1S == 0);
+    const int nb = n / QK_TQ4_1S;
+
+    for (int r = 0; r < nrc; ++r) {
+        const float * x = (const float *)((const char *)vx + r * bx);
+        const char  * y = (const char  *)vy + r * by;
+        float sum = 0.0f;
+        for (int ib = 0; ib < nb; ++ib) {
+            float buf[QK_TQ4_1S];
+            dequantize_row_tq4_1s((const block_tq4_1s *)(y + (size_t) ib * sizeof(block_tq4_1s)), buf, QK_TQ4_1S);
+            const float * xb = x + (size_t) ib * QK_TQ4_1S;
+            for (int j = 0; j < QK_TQ4_1S; ++j) {
+                sum += xb[j] * buf[j];
+            }
+        }
+        s[r] = sum;
+    }
 }
