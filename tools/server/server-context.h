@@ -110,6 +110,9 @@ struct server_context {
 
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
+
+    // register a callback invoked on the main loop thread after a model swap completes
+    void on_model_swapped(std::function<void()> callback);
 };
 
 

@@ -318,6 +318,9 @@ struct server_chat_params {
     std::string media_path;
     bool force_pure_content = false;
     int  n_ctx = 262144; // slot context window (used for prompt trimming)
+
+    // tokenizer used for accurate prompt-trimming token counts (not owned)
+    const struct llama_vocab * vocab = nullptr;
 };
 
 // used by /completions endpoint

@@ -512,6 +512,19 @@ struct server_task_result_metrics : server_task_result {
 };
 
 // used by /slots API
+struct server_task_result_model_swap : server_task_result {
+    std::string name;     // the requested model name (preset key)
+    std::string model;    // the resolved model_name (alias) of the newly loaded model
+    std::string path;     // the model file path
+    std::string error;    // empty on success
+
+    virtual bool is_error() override {
+        return !error.empty();
+    }
+
+    virtual json to_json() override;
+};
+
 struct server_task_result_slots : server_task_result {
     int n_idle_slots = 0;
 
