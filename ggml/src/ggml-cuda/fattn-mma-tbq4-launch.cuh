@@ -65,9 +65,6 @@ void ggml_cuda_flash_attn_ext_mma_tbq4_case(ggml_backend_cuda_context & ctx, ggm
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    constexpr ggml_type tK = GGML_TYPE_TBQ4_0;
-    constexpr ggml_type tV = GGML_TYPE_TBQ4_0;
-
 #if defined(GGML_USE_HIP)
     using fattn_kernel_ptr_t = const void*;
 #else

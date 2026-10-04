@@ -57,7 +57,7 @@ target_compile_definitions(llama PRIVATE
     LLAMA_COMMIT="${LLAMA_BUILD_COMMIT}"
 )
 
-target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE . ../ggml/src)
 target_include_directories(llama PUBLIC ../include)
 if (GGML_CUDA)
     # llama-context.cpp includes <cuda_runtime.h> for the async checkpoint path

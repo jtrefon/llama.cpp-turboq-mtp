@@ -4267,7 +4267,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             const auto types_str = string_split<std::string>(value, ',');
             auto types = common_speculative_types_from_names(types_str);
-            params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
+            // "none" resets the type list rather than appending to it: this lets a
+            // preset (e.g. a non-MTP model) override a --spec-type set on the command line
+            if (std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NONE) != types.end()) {
+                params.speculative.types = std::vector<common_speculative_type>{ COMMON_SPECULATIVE_TYPE_NONE };
+            } else {
+                params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
+            }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
     add_opt(common_arg(

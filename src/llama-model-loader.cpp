@@ -1344,9 +1344,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     return tensor;
 }
 
-void llama_model_loader::done_getting_tensors(bool partial) const {
-    if (n_created > n_tensors) {
-        throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
+struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required) {
+    const struct ggml_tensor * cur = check_tensor_dims(name, std::vector<int64_t>(ne), required, /*allow_reshape=*/false);
+
+    if (cur == NULL) {
+        return NULL;
     }
 
     if (cur->type != base->type) {

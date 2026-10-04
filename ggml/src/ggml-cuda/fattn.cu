@@ -4,7 +4,6 @@
 #include "fattn-mma-tbq4-launch.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
-#include "fattn-wmma-f16.cuh"
 #include "cpy-planar-iso.cuh"
 #include "fattn.cuh"
 
@@ -354,8 +353,6 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
     BEST_FATTN_KERNEL_MMA_TBQ4 = 500,
-
-    BEST_FATTN_KERNEL_WMMA_F16 = 501,
 };
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
