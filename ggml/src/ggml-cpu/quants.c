@@ -1434,21 +1434,22 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
 }
 
 // TQ4_1S: reference matvec via per-block dequantization (TurboQuant+ spike)
-void ggml_vec_dot_tq4_1s_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+// vx = tq4_1s blocks, vy = f16 row (vec_dot_type)
+void ggml_vec_dot_tq4_1s_f16(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_UNUSED(bs);
     GGML_ASSERT(n % QK_TQ4_1S == 0);
     const int nb = n / QK_TQ4_1S;
 
     for (int r = 0; r < nrc; ++r) {
-        const float * x = (const float *)((const char *)vx + r * bx);
-        const char  * y = (const char  *)vy + r * by;
+        const char         * x = (const char         *)vx + r * bx;
+        const ggml_fp16_t  * y = (const ggml_fp16_t  *)((const char *)vy + r * by);
         float sum = 0.0f;
         for (int ib = 0; ib < nb; ++ib) {
             float buf[QK_TQ4_1S];
-            dequantize_row_tq4_1s((const block_tq4_1s *)(y + (size_t) ib * sizeof(block_tq4_1s)), buf, QK_TQ4_1S);
-            const float * xb = x + (size_t) ib * QK_TQ4_1S;
+            dequantize_row_tq4_1s((const block_tq4_1s *)(x + (size_t) ib * sizeof(block_tq4_1s)), buf, QK_TQ4_1S);
+            const ggml_fp16_t * yb = y + (size_t) ib * QK_TQ4_1S;
             for (int j = 0; j < QK_TQ4_1S; ++j) {
-                sum += xb[j] * buf[j];
+                sum += buf[j] * GGML_FP16_TO_FP32(yb[j]);
             }
         }
         s[r] = sum;
