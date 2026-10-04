@@ -53,9 +53,9 @@ Follow-up commits complete the merge (it did not compile / had dropped features)
 
 | Upstream | Subject | Why pending |
 |---|---|---|
-| `6d1479c14` | ggml: fix ggml_backend_buft_get_alloc_size() guard | CONFLICT (fork touches the same alloc path) |
-| `526c43b8f` | mtmd: fix GCC 15 stringop-overflow in decode_embd_batch | CONFLICT (mtmd drift) |
-| `991991118` | server: fix router eviction races | CONFLICT (hot-swap/preset changes) |
+| `6d1479c14` | ggml: fix ggml_backend_buft_get_alloc_size() guard | N/A — fix targets the newer exempting assert; our `assert(size >= ggml_nbytes(tensor))` never fires |
+| `526c43b8f` | mtmd: fix GCC 15 stringop-overflow in decode_embd_batch | N/A — our tree already has `logits.resize(n_tokens)` (no `, 0`) |
+| `991991118` | server: fix router eviction races | not on our path — single model + in-process swap, no router |
 | rest of ~695 | Metal / Vulkan / SYCL / OpenCL / CANN / WebGPU / CI / UI / convert / gguf-py-only / docs | not relevant to this fork's path (RTX 4090, CUDA, TBQ) |
 
 ## Fork-local changes to re-verify after any sync
