@@ -2501,7 +2501,10 @@ void common_prompt_checkpoint::update_tgt(
 
     data_tgt.resize(ckpt_size);
 
-#ifdef GGML_USE_CUDA
+// NOTE: async checkpoint capture is disabled: post-merge it trips a backend assert /
+// deadlocks in the CUDA host-callback path with the MTP draft context. Falls back to
+// the synchronous path below (correct, just not overlapped with prefill).
+#if defined(GGML_USE_CUDA) && defined(LLAMA_CKPT_ASYNC_CAPTURE)
     // RTX-4090 / NVIDIA-dedicated: capture asynchronously into a pinned staging
     // buffer so the D2H transfer overlaps with subsequent prefill compute.
     int slot = g_ckpt_staging.acquire(ckpt_size);
@@ -2544,7 +2547,7 @@ void common_prompt_checkpoint::update_dft(
 
     data_dft.resize(ckpt_size);
 
-#ifdef GGML_USE_CUDA
+#if defined(GGML_USE_CUDA) && defined(LLAMA_CKPT_ASYNC_CAPTURE)
     int slot = g_ckpt_staging.acquire(ckpt_size);
     if (slot < 0) {
         cudaStreamSynchronize(cudaStreamPerThread);

@@ -911,8 +911,6 @@ public:
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
-    ggml_tensor * get_h_pre_norm() const { return t_h_pre_norm; }
-
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 

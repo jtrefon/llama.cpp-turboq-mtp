@@ -1049,47 +1049,6 @@ extern "C" {
     DEPRECATED(LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup),
             "user code should do warmup runs manually [TAG_LLAMA_GRAPH_NO_WARMUP]");
 
-    // [EXPERIMENTAL] MTP APIs, accessors for hidden states
-    LLAMA_API struct ggml_tensor * llama_context_get_t_h_pre_norm(struct llama_context * ctx);
-    LLAMA_API struct ggml_tensor * llama_context_get_t_mtp_out   (struct llama_context * ctx);
-
-    LLAMA_API void llama_set_mtp(
-            struct llama_context * ctx_target,
-            struct llama_context * ctx_mtp);
-
-    // Invalidate the cross-ubatch MTP pending stash (pending_h / pending_pos)
-    // on the target context. Must be called after any direct manipulation of
-    // the target memory (e.g. llama_memory_seq_rm on rejected draft rows) that
-    // moves the target frontier backward, otherwise handle_mtp_for_ubatch()
-    // sees pending_pos + 1 != pos_start on the next batch and the MTP draft
-    // head is never re-seeded (permanent desync -> repetition loop).
-    LLAMA_API void llama_reset_mtp_pending(
-            struct llama_context * ctx);
-
-    LLAMA_API bool llama_context_seq_rm(
-            struct llama_context * ctx,
-                    llama_seq_id   seq_id,
-                       llama_pos   p0,
-                       llama_pos   p1);
-
-    // Like llama_memory_seq_cp, but also mirrors the copy onto the attached MTP
-    // shadow context (if any), keeping its KV layout aligned with the target.
-    LLAMA_API void llama_context_seq_cp(
-            struct llama_context * ctx,
-                    llama_seq_id   seq_id_src,
-                    llama_seq_id   seq_id_dst,
-                       llama_pos   p0,
-                       llama_pos   p1);
-
-    // Like llama_memory_seq_add, but also mirrors the shift onto the attached MTP
-    // shadow context (if any), keeping its KV layout aligned with the target.
-    LLAMA_API void llama_context_seq_add(
-            struct llama_context * ctx,
-                    llama_seq_id   seq_id,
-                       llama_pos   p0,
-                       llama_pos   p1,
-                       llama_pos   delta);
-
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 

@@ -243,6 +243,9 @@ public:
     // note: used by n-gram input embeddings
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    // enable the signed rotation path (R = s1*H*s2) for TBQ KV on backends without a fused TBQ FA kernel
+    void set_attn_rot_signed(bool v) { attn_rot_signed = v; }
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;

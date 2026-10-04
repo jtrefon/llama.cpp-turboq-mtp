@@ -516,9 +516,6 @@ llama_context::~llama_context() {
             }
         }
     }
-    if (mtp.hook_batch.pos != nullptr) {
-        llama_batch_free(mtp.hook_batch);
-    }
     ggml_opt_free(opt_ctx);
 }
 
@@ -1436,14 +1433,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
-    }
-
-    if (mtp.ctx_mtp) {
-        handle_mtp_for_ubatch(
-                (int32_t) ubatch.n_tokens,
-                ubatch.token,
-                ubatch.pos,
-                res->t_h_pre_norm);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2693,7 +2682,13 @@ public:
 #ifdef GGML_USE_CUDA
         for (const auto & winfo : winfos) {
             ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, winfo.tensor);
-            ggml_backend_tensor_get_async(backend, winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            if (backend != nullptr) {
+                ggml_backend_tensor_get_async(backend, winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            } else {
+                // tensor is not assigned in the current scheduler graph (e.g. the MTP
+                // shadow / recurrent state); fall back to a blocking read from its own buffer
+                ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            }
         }
         (void) sched;
 #else
@@ -3996,136 +3991,6 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
 }
 
-ggml_tensor * llama_context::get_t_h_pre_norm() const {
-    return gf_res_prev ? gf_res_prev->t_h_pre_norm : nullptr;
-}
-
-ggml_tensor * llama_context_get_t_h_pre_norm(struct llama_context * ctx) {
-    return ctx ? ctx->get_t_h_pre_norm() : nullptr;
-}
-
-ggml_tensor * llama_context::get_t_mtp_out() const {
-    return gf_res_prev ? gf_res_prev->t_mtp_out : nullptr;
-}
-
-ggml_tensor * llama_context_get_t_mtp_out(struct llama_context * ctx) {
-    return ctx ? ctx->get_t_mtp_out() : nullptr;
-}
-
-void llama_set_mtp(struct llama_context * ctx_target, struct llama_context * ctx_mtp) {
-    if (!ctx_target) return;
-    ctx_target->set_mtp(ctx_mtp);
-}
-
-void llama_reset_mtp_pending(struct llama_context * ctx) {
-    if (!ctx) return;
-    ctx->reset_mtp_pending();
-}
-
-void llama_context::set_mtp(llama_context * ctx_mtp_in) {
-    if (mtp.ctx_mtp == ctx_mtp_in) return;
-
-    if (mtp.hook_batch.pos != nullptr) {
-        llama_batch_free(mtp.hook_batch);
-        mtp.hook_batch = llama_batch{};
-    }
-
-    mtp.ctx_mtp     = ctx_mtp_in;
-    mtp.pending_pos = -1;
-
-    if (mtp.ctx_mtp) {
-        const int32_t n_ub   = (int32_t) cparams.n_ubatch;
-        const int32_t n_embd = (int32_t) model.hparams.n_embd;
-        mtp.hook_batch       = llama_batch_init(n_ub, n_embd, 1);
-        mtp.hook_batch.token = (llama_token *) malloc(sizeof(llama_token) * n_ub);
-        mtp.pending_h.assign(n_embd, 0.0f);
-        LLAMA_LOG_INFO("%s: MTP draft head registered (ctx_mtp=%p, n_ubatch=%d, n_embd=%d)\n",
-                       __func__, (const void *) mtp.ctx_mtp, n_ub, n_embd);
-    } else {
-        mtp.pending_h.clear();
-        mtp.pending_h.shrink_to_fit();
-        LLAMA_LOG_INFO("%s: MTP draft head unregistered\n", __func__);
-    }
-}
-
-void llama_context::handle_mtp_for_ubatch(
-        int32_t                n_tokens,
-        const llama_token    * tokens,
-        const llama_pos      * positions,
-        struct ggml_tensor   * t) {
-    if (n_tokens == 0 || t == nullptr) {
-        return;
-    }
-    if (t->ne[1] != (int64_t) n_tokens) {
-        return;
-    }
-    const int64_t n_embd = model.hparams.n_embd;
-    GGML_ASSERT(t->ne[0] == n_embd);
-
-    const int       n_rows    = (int) n_tokens;
-    const llama_pos pos_start = positions[0];
-
-    const llama_pos pos_max_mtp = llama_memory_seq_pos_max(llama_get_memory(mtp.ctx_mtp), 0);
-    if (pos_start <= pos_max_mtp) {
-        return;
-    }
-
-    const bool pending_continues = mtp.pending_pos >= 0 && mtp.pending_pos + 1 == pos_start;
-    if (mtp.pending_pos >= 0 && !pending_continues) {
-        LLAMA_LOG_DEBUG("%s: pending_pos mismatch (pending=%d, pos_start=%d) — discarding stale pending state\n",
-                        __func__, (int) mtp.pending_pos, (int) pos_start);
-        mtp.pending_pos = -1;
-    }
-
-    synchronize();
-
-    const size_t row_bytes = (size_t) n_embd * sizeof(float);
-    const int    n_out     = (pending_continues ? 1 : 0) + (n_rows - 1);
-
-    if (n_out > 0) {
-        int out_idx = 0;
-        if (pending_continues) {
-            std::memcpy(mtp.hook_batch.embd + (size_t) out_idx * n_embd,
-                        mtp.pending_h.data(), row_bytes);
-            mtp.hook_batch.token[out_idx]     = tokens[0];
-            mtp.hook_batch.pos[out_idx]       = pos_start;
-            mtp.hook_batch.n_seq_id[out_idx]  = 1;
-            mtp.hook_batch.seq_id[out_idx][0] = 0;
-            mtp.hook_batch.logits[out_idx]    = 0;
-            ++out_idx;
-        }
-        for (int k = 0; k + 1 < n_rows; ++k) {
-            ggml_backend_tensor_get(t,
-                mtp.hook_batch.embd + (size_t) out_idx * n_embd,
-                (size_t) k * row_bytes,
-                row_bytes);
-            mtp.hook_batch.token[out_idx]     = tokens[k + 1];
-            mtp.hook_batch.pos[out_idx]       = positions[k + 1];
-            mtp.hook_batch.n_seq_id[out_idx]  = 1;
-            mtp.hook_batch.seq_id[out_idx][0] = 0;
-            mtp.hook_batch.logits[out_idx]    = 0;
-            ++out_idx;
-        }
-        GGML_ASSERT(out_idx == n_out);
-        mtp.hook_batch.n_tokens = n_out;
-
-        const int32_t rc_dec = llama_decode(mtp.ctx_mtp, mtp.hook_batch);
-        if (rc_dec != 0) {
-            LLAMA_LOG_ERROR("%s: llama_decode(ctx_mtp) failed rc=%d (pos=%d, n=%d)\n",
-                            __func__, (int) rc_dec, (int) pos_start, n_out);
-        }
-    }
-
-    // Stash the last h-row as the new pending (for the next ubatch's first
-    // token to pair with).
-    ggml_backend_tensor_get(t, mtp.pending_h.data(),
-        (size_t) (n_rows - 1) * row_bytes, row_bytes);
-    mtp.pending_pos = pos_start + n_rows - 1;
-
-    LLAMA_LOG_DEBUG("%s: processed %d rows, hook_batch n=%d, pending_pos=%d\n",
-                    __func__, n_rows, n_out, (int) mtp.pending_pos);
-}
-
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
 }
@@ -4317,59 +4182,6 @@ bool llama_memory_seq_rm(
     return mem->seq_rm(seq_id, p0, p1);
 }
 
-bool llama_context_seq_rm(
-    struct llama_context * ctx,
-            llama_seq_id   seq_id,
-               llama_pos   p0,
-               llama_pos   p1) {
-    if (!ctx) {
-        return true;
-    }
-    const bool ok = llama_memory_seq_rm(llama_get_memory(ctx), seq_id, p0, p1);
-
-    if (llama_context * ctx_mtp = ctx->get_mtp()) {
-        llama_memory_seq_rm(llama_get_memory(ctx_mtp), 0, p0, p1);
-        // Any target memory mutation can move the frontier under the
-        // cross-ubatch pending stash. A stale pending_h/pending_pos would
-        // pair the wrong hidden state with the first token of the next
-        // prefill/decode, so unconditionally invalidate it here. The cost of
-        // a spurious reset is one missed draft continuation; the cost of a
-        // stale stash is a permanent MTP desync that collapses into a
-        // repetition loop at high context (7ad6216b6 "fixed token forever").
-        // NOTE: the stash lives on the TARGET context (handle_mtp_for_ubatch
-        // reads this->mtp.pending_pos during target decode), not on the
-        // shadow — reset the target here.
-        ctx->reset_mtp_pending();
-    }
-    return ok;
-}
-
-void llama_context::reset_mtp_pending() {
-    LLAMA_LOG_DEBUG("%s: resetting MTP pending state\n", __func__);
-    mtp.pending_pos = -1;
-    std::fill(mtp.pending_h.begin(), mtp.pending_h.end(), 0.0f);
-}
-
-void llama_context_seq_cp(
-    struct llama_context * ctx,
-            llama_seq_id   seq_id_src,
-            llama_seq_id   seq_id_dst,
-               llama_pos   p0,
-               llama_pos   p1) {
-    if (!ctx) {
-        return;
-    }
-    llama_memory_seq_cp(llama_get_memory(ctx), seq_id_src, seq_id_dst, p0, p1);
-
-    if (llama_context * ctx_mtp = ctx->get_mtp()) {
-        llama_memory_seq_cp(llama_get_memory(ctx_mtp), seq_id_src, seq_id_dst, p0, p1);
-        // Positions were copied/overwritten — the cross-ubatch pending stash
-        // on the target no longer points at a valid frontier. Invalidate it
-        // (see llama_context_seq_rm for the rationale).
-        ctx->reset_mtp_pending();
-    }
-}
-
 void llama_memory_seq_cp(
         llama_memory_t mem,
           llama_seq_id seq_id_src,
@@ -4404,26 +4216,6 @@ void llama_memory_seq_add(
     }
 
     mem->seq_add(seq_id, p0, p1, delta);
-}
-
-void llama_context_seq_add(
-    struct llama_context * ctx,
-            llama_seq_id   seq_id,
-               llama_pos   p0,
-               llama_pos   p1,
-               llama_pos   delta) {
-    if (!ctx) {
-        return;
-    }
-    llama_memory_seq_add(llama_get_memory(ctx), seq_id, p0, p1, delta);
-
-    if (llama_context * ctx_mtp = ctx->get_mtp()) {
-        llama_memory_seq_add(llama_get_memory(ctx_mtp), 0, p0, p1, delta);
-        // Positions shifted by delta — the cross-ubatch pending stash on the
-        // target no longer points at a valid frontier. Invalidate it
-        // (see llama_context_seq_rm for the rationale).
-        ctx->reset_mtp_pending();
-    }
 }
 
 void llama_memory_seq_div(
