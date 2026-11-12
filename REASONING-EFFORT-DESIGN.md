@@ -1,6 +1,6 @@
 # Reasoning-Effort Implementation Proposal (llama-turboq fork)
 
-**Status: DESIGN APPROVED IN PRINCIPLE — NOT YET IMPLEMENTED (Jack: "dont proceed yet").**
+**Status: IMPLEMENTED + VERIFIED LIVE — pending local hardening tests, then merge + tag (Jack: "create PR only for now").**
 Owner: Jack + Frank · Model in scope: **Qwen3.8-27B (MTP)** on the llama-turboq fork, `:8081/v1`.
 Date: 2026-09-23. **This file is the single source of truth and is written to survive context compression. If it is truncated, trust the §0 header + §10 checklist.**
 
@@ -18,7 +18,7 @@ Date: 2026-09-23. **This file is the single source of truth and is written to su
 6. **Both doors (Jack: "can we do both"):** accept the **word** (`reasoning_effort`) for Hermes/pi/opencode AND the **raw number** (`reasoning_budget_tokens`/`thinking_budget_tokens`) for vLLM/SGLang/llama.cpp clients. One budget, two entry points.
 7. **Priority (highest wins):** raw number > word (mapped) > `models.ini` config > built-in default.
 8. **TOP LEVEL = UNLIMITED (Jack: "our top has to be unlimited AND widely used").** Hermes **clamps its top setting down to `max` on the wire** (`clamp_effort(effort, OPENAI_COMPAT_WIRE_EFFORTS)`, wire tops at `max`; docstring "ultra never reaches a wire"). So the TUI's "ultimate" arrives as **`max`**. Solution: **map `max` → unlimited (`-1`)** — because `max` is precisely the word OpenAI/Hermes/opencode/Ollama/GLM all send as their top. One word gives us "top = unlimited" AND "top = widely used." `ultra`/`unlimited` are aliases → also unlimited. `xhigh`=8192 is the highest FINITE level; raw numbers cover anything in between. **DECISION RESOLVED — no longer pending.**
-9. **Do NOT implement yet.** Jack wants to compress context first.
+9. **IMPLEMENTED + verified live** against the running server: `high`→4096, `minimal`→512, `max`→unlimited, raw `12345`→12345, raw `2048`+word→2048, no-field→8192 (config fallback). Awaiting local hardening tests → then merge + tag.
 10. **Verification:** unit (curl each word + raw number, assert `reasoning-budget: tokens=N` in log) + E2E (a >8192-thinking prompt completes at `xhigh`/`max`) + precedence (raw beats word; nothing-sent → config fallback) + back-compat + re-run the real Hermes session.
 
 ---
