@@ -1,4 +1,5 @@
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -14,12 +15,42 @@
 // set minimum query length to treat as prefill (32)
 #define GGML_SYCL_FA_ONEDNN_MIN_Q 32
 
-bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst) {
+bool ggml_sycl_fattn_onednn_binds_kv(const ggml_tensor * K, const ggml_tensor * V) {
+    if (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) {
+        return false;
+    }
+    auto bindable = [](const ggml_tensor * t) {
+        return t->nb[0] == sizeof(sycl::half) && t->nb[1] % sizeof(sycl::half) == 0 &&
+               t->nb[2] % sizeof(sycl::half) == 0 && t->nb[3] % sizeof(sycl::half) == 0;
+    };
+    return bindable(K) && bindable(V);
+}
+
+#if GGML_SYCL_DNNL
+// per device: set once a oneDNN SDPA execute throws, so dispatch stops picking oneDNN there
+static std::atomic<bool> g_ggml_sycl_fa_onednn_failed[GGML_SYCL_MAX_DEVICES] = {};
+#endif
+
+bool ggml_sycl_flash_attn_ext_onednn_failed(int device) {
+#if GGML_SYCL_DNNL
+    return g_ggml_sycl_fa_onednn_failed[device].load(std::memory_order_relaxed);
+#else
+    GGML_UNUSED(device);
+    return false;
+#endif
+}
+
+bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use_shape_limit) {
 #if !GGML_SYCL_DNNL
     GGML_UNUSED(dst);
+    GGML_UNUSED(use_shape_limit);
     return false;
 #else
     if (!g_ggml_sycl_fa_onednn) {
+        return false;
+    }
+    // without a fused SDPA kernel oneDNN falls back to the same matmul, so reuse the check
+    if (!ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device())) {
         return false;
     }
     const ggml_tensor * Q     = dst->src[0];
@@ -44,7 +75,7 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst) {
         if (!k_ok || !v_ok) {
             return false;
         }
-        if (Q->ne[1] < 32 || K->ne[1] < 1024) {
+        if (use_shape_limit && (Q->ne[1] < 32 || K->ne[1] < 1024)) {
             return false;
         }
         for (const ggml_tensor * t : {K, V}) {
@@ -52,17 +83,6 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst) {
                 return false;
             }
         }
-    }
-    // This is the improved SPDA gate. Rather than gating Alchemist GPUs from all SPDA features, we instead target only the failing shapes.
-    // If the GPU being assessed isn't in the grouping below, it has full access to all SPDA shapes. Otherwise, if it's an Alchemist GPU, we block only the shapes with head sizes that fail.
-    // It is much easier to compare the device to a small list of failing cases than to define all the passing ones.
-    const gpu_arch arch = ggml_sycl_info().devices[ggml_sycl_get_device()].hw_info.arch;
-    bool support_spda = !(arch == gpu_arch::intel_gpu_dg2_g10 ||
-                         arch == gpu_arch::intel_gpu_dg2_g11 ||
-                         arch == gpu_arch::intel_gpu_dg2_g12);
-
-    if (!support_spda && K->ne[0] == 64) {
-        return false;
     }
     // Optional KV-length ceiling (GGML_SYCL_FA_ONEDNN_MAX_KV, 0 = unlimited). Escape hatch:
     // very long sequences make the fused SDPA slow enough to risk the xe driver watchdog on
@@ -94,7 +114,7 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst) {
         return false;
     }
     // Prefill only.
-    if (Q->ne[1] < GGML_SYCL_FA_ONEDNN_MIN_Q) {
+    if (use_shape_limit && Q->ne[1] < GGML_SYCL_FA_ONEDNN_MIN_Q) {
         return false;
     }
     return true;
@@ -140,14 +160,6 @@ static void permute_sdpa_out_sycl(const sycl::half * out, float * dst,
         dst[e + h * d + t * d * H + b * d * H * q] = (float) out[gid];
     });
 }
-
-struct sdpa_partition {
-    compiled_partition          cp;
-    std::vector<logical_tensor> ins;
-    logical_tensor              out;
-    size_t id_q = 0, id_k = 0, id_v = 0, id_scale = 0, id_mask = 0;
-    bool   ok = false;
-};
 
 // Build + compile the contiguous-input GQA SDPA graph (MatMul->Divide->Add->SoftMax->MatMul), f32 out.
 // Mirrors the hardware-verified scratch/onednn_sdpa_probe.cpp build_gqa (partitions=1, sdp_primitive_kernel_t).
@@ -240,9 +252,16 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     dnnl::engine    eng    = ctx.engine_dnnl(stream);
     dnnl::stream    strm   = ctx.stream_dnnl(stream);
 
+    const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst);
+
     // Q: always f32 -- copy to dense f16.
-    ggml_sycl_pool_alloc<sycl::half> Qf(ctx.pool(), (size_t) H * q * d);
-    cont_to_f16_sycl<float>((const char *) Q->data, Qf.get(), d, q, H, mb, Q->nb[1], Q->nb[2], Q->nb[3], stream);
+    std::optional<ggml_sycl_pool_alloc<sycl::half>> Qf_pool;
+    sycl::half * Qf_ptr = (sycl::half *) extra.Q_buffer_ptr;
+    if (!Qf_ptr) {
+        Qf_pool.emplace(ctx.pool(), (size_t) H * q * d);
+        Qf_ptr = Qf_pool->get();
+    }
+    cont_to_f16_sycl<float>((const char *) Q->data, Qf_ptr, d, q, H, mb, Q->nb[1], Q->nb[2], Q->nb[3], stream);
 
     // K/V: bind the f16 cache in place. llama.cpp permutes it to [token][head][dim], so its head
     // plane is strided rather than dense, which is what an explicit stride vector expresses.
@@ -253,11 +272,12 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     std::array<int64_t, 5> v_str = k_str;
     std::optional<ggml_sycl_pool_alloc<sycl::half>> Kf_pool;
     std::optional<ggml_sycl_pool_alloc<sycl::half>> Vf_pool;
+    // Helper: hand out reserved space, or fall back to the pool.
+    auto stage_k = [&](size_t n) { if (extra.K_buffer_ptr) { return (sycl::half *) extra.K_buffer_ptr; }
+                                  Kf_pool.emplace(ctx.pool(), n); return Kf_pool->get(); };
+    auto stage_v = [&](size_t n) { if (extra.V_buffer_ptr) { return (sycl::half *) extra.V_buffer_ptr; }
+                                  Vf_pool.emplace(ctx.pool(), n); return Vf_pool->get(); };
 
-    auto bindable = [](const ggml_tensor * t) {
-        return t->nb[0] == sizeof(sycl::half) && t->nb[1] % sizeof(sycl::half) == 0 &&
-               t->nb[2] % sizeof(sycl::half) == 0 && t->nb[3] % sizeof(sycl::half) == 0;
-    };
     auto elem_strides = [](const ggml_tensor * t) {
         const int64_t s1 = (int64_t) (t->nb[1] / t->nb[0]);
         const int64_t s2 = (int64_t) (t->nb[2] / t->nb[0]);
@@ -266,48 +286,31 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         return std::array<int64_t, 5>{ s3, s2, s2, s1, 1 };
     };
 
-    if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 && bindable(K) && bindable(V)) {
+    if (ggml_sycl_fattn_onednn_binds_kv(K, V)) {
         K_ptr = (sycl::half *) K->data;
         V_ptr = (sycl::half *) V->data;
         k_str = elem_strides(K);
         v_str = elem_strides(V);
     } else if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
-        Kf_pool.emplace(ctx.pool(), (size_t) Hkv * seq * d);
-        Vf_pool.emplace(ctx.pool(), (size_t) Hkv * seq * d);
-        cont_to_f16_sycl<sycl::half>((const char *) K->data, Kf_pool->get(), d, seq, Hkv, mb, K->nb[1], K->nb[2], K->nb[3], stream);
-        cont_to_f16_sycl<sycl::half>((const char *) V->data, Vf_pool->get(), d, seq, Hkv, mb, V->nb[1], V->nb[2], V->nb[3], stream);
-        K_ptr = Kf_pool->get();
-        V_ptr = Vf_pool->get();
+        K_ptr = stage_k((size_t) Hkv * seq * d);
+        V_ptr = stage_v((size_t) Hkv * seq * d);
+        cont_to_f16_sycl<sycl::half>((const char *) K->data, K_ptr, d, seq, Hkv, mb, K->nb[1], K->nb[2], K->nb[3], stream);
+        cont_to_f16_sycl<sycl::half>((const char *) V->data, V_ptr, d, seq, Hkv, mb, V->nb[1], V->nb[2], V->nb[3], stream);
     } else if (ggml_is_quantized(K->type)) {
         // Quantized K/V: dequant to dense F16 using pool, same lifetime as F16 path.
-        Kf_pool.emplace(ctx.pool(), ggml_nelements(K));
-        K_ptr = Kf_pool->get();
+        K_ptr = stage_k((size_t) ggml_nelements(K));
         {
             const char * K_data = (const char *)K->data;
             const bool k_non_dense = ((int64_t)K->ne[1] * K->nb[1] != K->nb[2]) && K->ne[2] > 1;
-            const bool k_gemma = k_non_dense &&
-                ((int64_t)K->nb[2] < (int64_t)K->ne[1] * (int64_t)K->nb[1]);
             if (ggml_is_contiguously_allocated(K) && !k_non_dense) {
                 to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(K->type, dst);
                 to_fp16(K_data, K_ptr, ggml_nelements(K), stream);
             } else {
-                const size_t bs = ggml_blck_size(K->type);
                 const size_t ts = ggml_type_size(K->type);
                 to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(K->type);
-                int64_t s01, s02, s03;
-                if (k_gemma) {
-                    const int64_t blk_per_row = (int64_t)K->ne[0] / bs;
-                    s01 = (int64_t)Hkv * blk_per_row;
-                    s02 = blk_per_row;
-                    s03 = (int64_t)K->ne[1] * s01;
-                } else {
-                    s01 = (int64_t)K->nb[1] / ts;
-                    s02 = (int64_t)K->nb[2] / ts;
-                    s03 = (int64_t)K->nb[3] / ts;
-                }
                 to_fp16(K_data, K_ptr,
                         K->ne[0], K->ne[1], K->ne[2], K->ne[3],
-                        s01, s02, s03, stream);
+                        (int64_t)K->nb[1] / ts, (int64_t)K->nb[2] / ts, (int64_t)K->nb[3] / ts, stream);
             }
         }
         // Quantized V: always dequant separately. Even when K and V share
@@ -315,44 +318,27 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         // data pointer), their logical values differ because the quantized
         // elements at different positions/offsets represent different K/V
         // data. Master's F16 path also never aliases K and V.
-        Vf_pool.emplace(ctx.pool(), ggml_nelements(V));
-        V_ptr = Vf_pool->get();
+        V_ptr = stage_v((size_t) ggml_nelements(V));
         {
             const char * V_data = (const char *)V->data;
             const bool v_non_dense = ((int64_t)V->ne[1] * V->nb[1] != V->nb[2]) && V->ne[2] > 1;
-            const bool v_gemma = v_non_dense &&
-                ((int64_t)V->nb[2] < (int64_t)V->ne[1] * (int64_t)V->nb[1]);
             if (ggml_is_contiguously_allocated(V) && !v_non_dense) {
                 to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(V->type, dst);
                 to_fp16(V_data, V_ptr, ggml_nelements(V), stream);
             } else {
-                const size_t bs = ggml_blck_size(V->type);
                 const size_t ts = ggml_type_size(V->type);
                 to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(V->type);
-                int64_t s01, s02, s03;
-                if (v_gemma) {
-                    const int64_t blk_per_row = (int64_t)V->ne[0] / bs;
-                    s01 = (int64_t)V->ne[2] * blk_per_row;
-                    s02 = blk_per_row;
-                    s03 = (int64_t)V->ne[1] * s01;
-                } else {
-                    s01 = (int64_t)V->nb[1] / ts;
-                    s02 = (int64_t)V->nb[2] / ts;
-                    s03 = (int64_t)V->nb[3] / ts;
-                }
                 to_fp16(V_data, V_ptr,
                         V->ne[0], V->ne[1], V->ne[2], V->ne[3],
-                        s01, s02, s03, stream);
+                        (int64_t)V->nb[1] / ts, (int64_t)V->nb[2] / ts, (int64_t)V->nb[3] / ts, stream);
             }
         }
     } else {
         // F32: strided copy to dense F16 via cont_to_f16_sycl<float>.
-        Kf_pool.emplace(ctx.pool(), ggml_nelements(K));
-        K_ptr = Kf_pool->get();
+        K_ptr = stage_k((size_t) ggml_nelements(K));
         cont_to_f16_sycl<float>((const char *) K->data, K_ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3],
                                 K->nb[1], K->nb[2], K->nb[3], stream);
-        Vf_pool.emplace(ctx.pool(), ggml_nelements(V));
-        V_ptr = Vf_pool->get();
+        V_ptr = stage_v((size_t) ggml_nelements(V));
         cont_to_f16_sycl<float>((const char *) V->data, V_ptr, V->ne[0], V->ne[1], V->ne[2], V->ne[3],
                                 V->nb[1], V->nb[2], V->nb[3], stream);
     }
@@ -366,23 +352,32 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     // instead -- the value is captured into the command, so no host memory has to outlive the
     // call, and the enqueue stays async.
     const sycl::half scale_h = (sycl::half) (1.0f / kq_scale);
-    ggml_sycl_pool_alloc<sycl::half> scbuf(ctx.pool(), 1);
-    sycl::half * const scale_dev = scbuf.get();
+    std::optional<ggml_sycl_pool_alloc<sycl::half>> scbuf;
+    sycl::half * scale_dev = (sycl::half *) extra.scale_buffer_ptr;
+    if (!scale_dev) {
+        scbuf.emplace(ctx.pool(), 1);
+        scale_dev = scbuf->get();
+    }
     stream->single_task([=]() { *scale_dev = scale_h; });
 
-    ggml_sycl_pool_alloc<sycl::half> outf(ctx.pool(), (size_t) H * q * d);   // f16 contiguous SDPA out [mb,H,q,d]
+    // f16 contiguous SDPA out [mb,H,q,d]
+    std::optional<ggml_sycl_pool_alloc<sycl::half>> outf_pool;
+    sycl::half * outf_ptr = (sycl::half *) extra.out_buffer_ptr;
+    if (!outf_ptr) {
+        outf_pool.emplace(ctx.pool(), (size_t) H * q * d);
+        outf_ptr = outf_pool->get();
+    }
 
-    // compile once per (device, shape, KV strides), reuse across layers/calls. Stride 2 always
-    // repeats stride 1 and stride 4 is always 1, so the key covers every entry that can differ.
-    static std::unordered_map<std::string, sdpa_partition> cache;
+    // compile once per (shape, KV strides) in this device's context, reuse across layers/calls. Stride 2
+    // always repeats stride 1 and stride 4 is always 1, so the key covers every entry that can differ.
     char keyb[256];
-    snprintf(keyb, sizeof(keyb), "%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld", ggml_sycl_get_device(),
+    snprintf(keyb, sizeof(keyb), "%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld",
              (long long) H, (long long) Hkv, (long long) q, (long long) seq, (long long) d,
              (long long) k_str[0], (long long) k_str[1], (long long) k_str[3],
              (long long) v_str[0], (long long) v_str[1], (long long) v_str[3]);
-    auto it = cache.find(keyb);
-    if (it == cache.end()) {
-        it = cache.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d, k_str, v_str)).first;
+    auto it = ctx.sdpa_partitions.find(keyb);
+    if (it == ctx.sdpa_partitions.end()) {
+        it = ctx.sdpa_partitions.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d, k_str, v_str)).first;
     }
     sdpa_partition & E = it->second;
     if (!E.ok) {
@@ -392,7 +387,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     }
 
     auto id2ptr = [&](size_t r) -> void * {
-        if (r == E.id_q)     return Qf.get();
+        if (r == E.id_q)     return Qf_ptr;
         if (r == E.id_k)     return K_ptr;
         if (r == E.id_v)     return V_ptr;
         if (r == E.id_scale) return scale_dev;
@@ -404,10 +399,10 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     for (auto & lt : E.ins) {
         ti.emplace_back(lt, eng, id2ptr(lt.get_id()));
     }
-    tensor to(E.out, eng, outf.get());
+    tensor to(E.out, eng, outf_ptr);
     E.cp.execute(strm, ti, {to});
 
-    permute_sdpa_out_sycl(outf.get(), (float *) dst->data, mb, H, q, d, stream);
+    permute_sdpa_out_sycl(outf_ptr, (float *) dst->data, mb, H, q, d, stream);
     // Single device needs no sync: the dnnl stream wraps this same in-order queue, so the SDPA
     // serializes with the staging kernels before it and the permute/pool reuse after it. The
     // garbage output formerly blamed on the missing sync here was the scale use-after-return
@@ -418,8 +413,10 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     }
 }
 catch (const std::exception & e) {
-    // any oneDNN/SYCL failure is non-fatal: fall back to the existing kernel (strictly additive).
-    GGML_LOG_WARN("%s: oneDNN SDPA failed (%s); falling back to TILE kernel\n", __func__, e.what());
+    // any oneDNN/SYCL failure is non-fatal: warn once, stop picking oneDNN on this device, run TILE instead
+    if (!g_ggml_sycl_fa_onednn_failed[ctx.device].exchange(true)) {
+        GGML_LOG_WARN("%s: oneDNN SDPA failed (%s); falling back to TILE kernel\n", __func__, e.what());
+    }
     ggml_sycl_flash_attn_ext_tile(ctx, dst);
 }
 

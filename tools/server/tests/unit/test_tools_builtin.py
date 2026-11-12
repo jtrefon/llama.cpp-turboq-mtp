@@ -64,11 +64,11 @@ def test_tools_builtin_read_file():
     assert "def test_tools_builtin_read_file" in text
 
 
-def test_tools_builtin_write_then_edit_file():
+def test_tools_builtin_write_then_edit_file(tmp_path):
     global server
     server.start()
 
-    log_path = os.path.join(PROJECT_ROOT, "test.log")
+    log_path = str(tmp_path / "test.log")
     try:
         write_res = call_tool("write_file", {"path": log_path, "content": "line1\nline2\nline3\n"})
         assert write_res["result"] == "file written successfully"
@@ -93,11 +93,11 @@ def test_tools_builtin_write_then_edit_file():
             os.remove(log_path)
 
 
-def test_tools_builtin_edit_file_rejects_non_unique_old_text():
+def test_tools_builtin_edit_file_rejects_non_unique_old_text(tmp_path):
     global server
     server.start()
 
-    log_path = os.path.join(PROJECT_ROOT, "test.log")
+    log_path = str(tmp_path / "test.log")
     try:
         call_tool("write_file", {"path": log_path, "content": "dup\ndup\n"})
         err = call_tool_expect_error("edit_file", {
@@ -206,6 +206,21 @@ def test_tools_builtin_runtime_header(container_engine: str, container_id: str):
     assert "hello container" in exec_res["plain_text_response"]
 
 
+def test_tools_builtin_runtime_header_refused_with_configured_runtime(container_engine: str, container_id: str):
+    global server
+    server.server_tools_runtime = f"{container_engine}-container:{container_id}"
+    server.start()
+
+    res = call_tool("exec_shell_command", {"command": "echo sandboxed"})
+    assert "sandboxed" in res["plain_text_response"]
+
+    for runtime in ["ssh:user@internal-host", f"{container_engine}-container:other", server.server_tools_runtime]:
+        res = server.make_request("POST", "/tools",
+                                  data={"tool": "exec_shell_command", "params": {"command": "echo hi"}},
+                                  headers={"x-tool-runtime": runtime})
+        assert res.status_code == 403, res.body
+
+
 def test_tools_builtin_runtime_header_unknown_scheme():
     global server
     server.start()
@@ -275,11 +290,11 @@ def test_tools_builtin_docker_runtime_cleans_up_spawned_container():
     assert leftover.returncode != 0, f"container {container_id} was not cleaned up after server exit"
 
 
-def test_tools_builtin_edit_file_rejects_overlapping_edits():
+def test_tools_builtin_edit_file_rejects_overlapping_edits(tmp_path):
     global server
     server.start()
 
-    log_path = os.path.join(PROJECT_ROOT, "test.log")
+    log_path = str(tmp_path / "test.log")
     try:
         call_tool("write_file", {"path": log_path, "content": "line1\nline2\n"})
         err = call_tool_expect_error("edit_file", {
