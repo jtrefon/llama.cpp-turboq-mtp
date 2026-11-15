@@ -2109,6 +2109,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_GATED_DELTA_NET_PIPE:
+            {
+                GGML_ABORT("GGML_OP_GATED_DELTA_NET_PIPE is not supported on CPU");
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
