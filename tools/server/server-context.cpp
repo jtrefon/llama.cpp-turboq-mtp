@@ -1879,15 +1879,15 @@ private:
             /* reasoning_format      */ params_base.reasoning_format,
             /* chat_template_kwargs  */ params_base.default_template_kwargs,
             /* tmpls                 */ std::move(chat_templates),
-            /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
-            /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
-            /* allow_video           */ mctx ? mtmd_helper_support_video(mctx) : false,
+            /* allow_image           */ mtmd_cap.vision,
+            /* allow_audio           */ mtmd_cap.audio,
+            /* allow_video           */ mtmd_cap.video,
             /* enable_thinking       */ enable_thinking,
             /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
             /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
             /* media_path            */ params_base.media_path,
-            /* force_pure_content    */ params_base.force_pure_content_parser,
-            /* n_ctx                 */ params_base.n_ctx
+            /* media_allow_private   */ params_base.media_allow_private_urls,
+            /* force_pure_content    */ params_base.force_pure_content_parser
         };
         chat_params.vocab = vocab;
 
