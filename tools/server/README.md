@@ -270,7 +270,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload)<br/>use --list-devices to see a list of available devices |
 | `--spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |
 | `--spec-draft-model, -md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_MODEL) |
-| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
+| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dflash,draft-dspark,draft-dflash2,draft-lilicorr,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
 | `--spec-ngram-mod-n-min N` | minimum number of ngram tokens to use for ngram-based speculative decoding (default: 48) |
 | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
 | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
@@ -1459,6 +1459,95 @@ Acts on an in-flight completion identified by its `id` (the `id` field streamed 
 **Response format**
 
 Returns a JSON object with a boolean `success` field, and an optional `message` field describing the reason when `success` is `false`.
+
+### WebSocket `/v1/realtime`: Realtime transcription
+
+Transcribes streamed audio, for models with a streaming audio encoder. Compatible with OAI `/v1/realtime` schema.
+
+Models that write the text while they listen use this endpoint: Voxtral Realtime, and live ASR models, which carry the prompt of their transcription in a chat template named `asr` (e.g. the LFM3-Audio live ASR checkpoints, the text of every 0.96 s of audio follows it). A live ASR model restarts its context at a pause after 15 s and always after 30 s, the transcript then goes on in a new line. A commit completes the audio with silence, so that its text comes out.
+
+Live ASR models can also hold a conversation, so they transcribe live only in sessions opened with `/v1/realtime?intent=transcription`, as OpenAI transcription sessions are; other sessions are a [realtime conversation](#realtime-conversation).
+
+Audio must be PCM16, mono. By default it is at the model sample rate, returned in `session.created` as `audio.input.format.rate`. A client can send another rate (8000 to 192000 Hz) by setting `audio.input.format.rate` with `session.update`, the server then resamples it. Each `input_audio_buffer.append` carries a base64-encoded chunk of PCM16 samples.
+
+*Client events:*
+
+- `session.update`: only `audio.input.format.rate` is used, the server replies with `session.updated`
+- `input_audio_buffer.append`: `audio` holds base64 PCM16 samples
+- `input_audio_buffer.commit`: flushes the audio received so far, so the words still held back by the model's delay are produced. The server replies with `input_audio_buffer.committed` and starts a new item. With `"final": true`, the input ends instead and the last item is completed once the stream drains.
+- `input_audio_buffer.clear`: accepted for compatibility, audio already sent cannot be discarded
+
+Closing the websocket also ends the input.
+
+*Server events:*
+
+- `session.created` and `session.updated`: carry the `session` object
+- `conversation.item.input_audio_transcription.delta`: `delta` holds the new text for `item_id`
+- `conversation.item.input_audio_transcription.completed`: `transcript` holds the full text of `item_id`
+- `input_audio_buffer.committed`: `item_id` of the committed item, `previous_item_id` of the item committed before it (`null` for the first one)
+- `error`: `error.message` describes the problem
+
+Note that words held back by the model's delay at the time of a commit are attributed to the next item.
+
+#### Realtime conversation
+
+Models that answer after the audio, like LFM3-Audio and LFM3-Omni, hold a conversation on the same endpoint (with an `asr` template, unless the session is opened with `?intent=transcription`). The audio is prefilled as it arrives, so the response starts right after the last chunk. Audio input is PCM16 mono, by default at the model sample rate (`audio.input.format.rate` of `session.created`); another rate set with `session.update` is resampled by the server. Audio output is PCM16 mono at `audio.output.format.rate`.
+
+`session.type` selects the session, it can be changed with `session.update` before the first audio or message:
+
+- `realtime` (default): a conversation, every response stays in context for the next turns
+- `transcription`: each committed audio buffer is transcribed on its own, `audio.input.transcription.language` picks the language
+
+*Client events:*
+
+- `session.update`: `type`, `audio.input.format.rate` (8000 to 192000 Hz), `instructions` (the system prompt, before the first audio or message), `output_modalities`, `max_output_tokens` (an integer or `"inf"`, the default), `tools` (functions with `name`, `description` and `parameters`, before the first audio or message) and `tool_choice` (`"auto"`, the default, `"none"` or `"required"`)
+- `input_audio_buffer.append`: `audio` holds base64 PCM16 samples
+- `input_audio_buffer.commit`: ends the audio of the user turn, in a transcription session the transcript follows
+- `conversation.item.create`: a user message with `input_text` content, or a `function_call_output` with the `call_id` and `output` of a tool call of the last response
+- `response.create`: ends the user turn and generates the response, `response.output_modalities`, `response.max_output_tokens` and `response.tool_choice` override the session
+- `response.cancel`: stops the response being generated
+
+LFM3-Omni is not trained to reason, run it with `--reasoning off` so that its turns open with an empty think block.
+
+`output_modalities` picks the mode of the responses: left out, the model switches between text and audio on its own; `["text"]` keeps the response in text, `["audio"]` makes it speech and `["text", "audio"]` interleaves text with the speech.
+
+*Server events:*
+
+- `session.created` and `session.updated`: carry the `session` object
+- `input_audio_buffer.committed`, `conversation.item.added`, `conversation.item.done`: the user item
+- `response.created`, `response.output_item.added`, `response.content_part.added`, then `response.output_text.delta` and `response.output_audio.delta` (base64 PCM16) as they are generated, then the `.done` events and `response.done`
+- `response.output_item.added` with a `function_call` item, `response.function_call_arguments.delta` and `.done`: a tool call of the response, its arguments are a JSON string
+- `conversation.item.input_audio_transcription.delta` and `.completed`: in a transcription session
+- `error`: `error.message` describes the problem
+
+Tools go into the system prompt with the chat template, and the tool calls are parsed as in `/v1/chat/completions`. The client runs the calls of a response, sends their results as `function_call_output` items, then asks for the next response.
+
+### POST `/v1/audio/speech`: OpenAI-compatible Speech API
+
+Generates speech from text, for models that can generate audio. The request is converted to a [`/tts`](#post-tts-generate-speech-audio-from-text) request, so the `/tts` options such as `lang`, `seed` or `speaker_ref_b64` can also be used.
+
+*Options:*
+
+`input`: The text to speak.
+
+`voice`: One of the `voices` listed by `GET /props`, as a name or as `{"id": "..."}`. OpenAI voice names such as `alloy` are not mapped: a model with predefined voices rejects them.
+
+`response_format`: `wav` or `pcm` (raw signed 16-bit little-endian mono samples, no header). Defaults to `wav`, unlike the `mp3` of the OpenAI API. Other formats are rejected. The sample rate is the one of the model and is not resampled to the 24 kHz of the OpenAI API, the response `Content-Type` carries it.
+
+`stream_format`: `audio` streams the response as it becomes available, see `stream` in `/tts` for the WAV header it writes. `sse` is rejected. The response is not streamed when omitted.
+
+`speed`: Only `1.0` is accepted.
+
+`instructions`: Ignored.
+
+*Examples:*
+
+```shell
+curl http://127.0.0.1:8080/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"model": "tts", "input": "Hello, this is a test."}' \
+    -o output.wav
+```
 
 ### POST `/v1/responses`: OpenAI-compatible Responses API
 
