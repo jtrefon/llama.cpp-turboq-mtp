@@ -1,5 +1,9 @@
 llama_add_compile_flags()
 
+if (GGML_HIP)
+    add_compile_definitions(GGML_USE_HIP)
+endif()
+
 #
 # libraries
 #
