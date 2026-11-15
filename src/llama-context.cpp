@@ -24,7 +24,7 @@
 #include <string>
 #include <unordered_map>
 
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #define LLAMA_USE_CUDA_RUNTIME
 #endif
 

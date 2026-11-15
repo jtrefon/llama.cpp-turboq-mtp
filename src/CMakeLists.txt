@@ -1,9 +1,5 @@
 llama_add_compile_flags()
 
-if (GGML_HIP)
-    add_compile_definitions(GGML_USE_HIP)
-endif()
-
 #
 # libraries
 #
@@ -86,6 +82,10 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 find_package(Threads REQUIRED)
 target_link_libraries(llama PUBLIC ggml PRIVATE Threads::Threads)
+
+if (GGML_CUDA AND NOT GGML_HIP AND NOT GGML_MUSA)
+    target_link_libraries(llama PRIVATE CUDA::cudart)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

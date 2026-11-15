@@ -226,6 +226,17 @@ if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
 endif()
 
+if (GGML_HIP)
+    add_compile_definitions(GGML_USE_HIP)
+endif()
+if (GGML_MUSA)
+    add_compile_definitions(GGML_USE_MUSA)
+endif()
+
+if (GGML_CUDA AND NOT GGML_HIP AND NOT GGML_MUSA)
+    find_package(CUDAToolkit REQUIRED)
+endif()
+
 #
 # build the library
 #

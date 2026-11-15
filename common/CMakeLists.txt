@@ -155,6 +155,10 @@ endif()
 target_link_libraries(${TARGET} PUBLIC  llama-common-base)
 target_link_libraries(${TARGET} PRIVATE cpp-httplib)
 
+if (GGML_CUDA AND NOT GGML_HIP AND NOT GGML_MUSA)
+    target_link_libraries(${TARGET} PRIVATE CUDA::cudart)
+endif()
+
 if (LLAMA_LLGUIDANCE)
     include(ExternalProject)
     set(LLGUIDANCE_SRC ${CMAKE_BINARY_DIR}/llguidance/source)

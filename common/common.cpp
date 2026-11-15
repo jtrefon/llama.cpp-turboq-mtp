@@ -25,7 +25,11 @@
 #include <filesystem>
 #include <mutex>
 
-#ifdef GGML_USE_CUDA
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#define LLAMA_USE_CUDA_RUNTIME
+#endif
+
+#ifdef LLAMA_USE_CUDA_RUNTIME
 #include <cuda_runtime.h>
 #endif
 #include <fstream>
@@ -2418,7 +2422,7 @@ bool common_prompt_batch_decode(
     return true;
 }
 
-#ifdef GGML_USE_CUDA
+#ifdef LLAMA_USE_CUDA_RUNTIME
 // RTX-4090 / NVIDIA-dedicated: small rotating pool of PINNED host buffers used as
 // staging for async checkpoint D2H copies. Bounded to N slots (~2x max checkpoint
 // size) so pinned (locked) RAM stays tiny; the CUDA host callback releases a slot
@@ -2495,7 +2499,7 @@ bool common_prompt_checkpoint::empty() const {
 }
 
 void common_prompt_checkpoint::clear() {
-#ifdef GGML_USE_CUDA
+#ifdef LLAMA_USE_CUDA_RUNTIME
     if (async_active_tgt && !copied_tgt.load()) {
         cudaStreamSynchronize(cudaStreamPerThread);
     }
@@ -2529,7 +2533,7 @@ void common_prompt_checkpoint::clear() {
 }
 
 common_prompt_checkpoint::~common_prompt_checkpoint() {
-#ifdef GGML_USE_CUDA
+#ifdef LLAMA_USE_CUDA_RUNTIME
     // wait for any in-flight async capture callback, then free the CUDA event
     if (async_active_tgt && !copied_tgt.load()) {
         cudaStreamSynchronize(cudaStreamPerThread);
@@ -2554,7 +2558,7 @@ common_prompt_checkpoint::common_prompt_checkpoint(common_prompt_checkpoint && o
       pos_max(o.pos_max),
       data_tgt(std::move(o.data_tgt)),
       data_dft(std::move(o.data_dft))
-#ifdef GGML_USE_CUDA
+#ifdef LLAMA_USE_CUDA_RUNTIME
       , cuda_event_tgt(o.cuda_event_tgt)
       , cuda_event_dft(o.cuda_event_dft)
       , staging_slot_tgt(o.staging_slot_tgt)
@@ -2565,7 +2569,7 @@ common_prompt_checkpoint::common_prompt_checkpoint(common_prompt_checkpoint && o
       , async_active_dft(o.async_active_dft)
 #endif
 {
-#ifdef GGML_USE_CUDA
+#ifdef LLAMA_USE_CUDA_RUNTIME
     // take ownership; clear source so its destructor leaves our resources alone
     o.cuda_event_tgt   = nullptr;
     o.cuda_event_dft   = nullptr;
@@ -2589,7 +2593,7 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_che
         data_tgt = std::move(o.data_tgt);
         data_dft = std::move(o.data_dft);
 
-#ifdef GGML_USE_CUDA
+#ifdef LLAMA_USE_CUDA_RUNTIME
         cuda_event_tgt   = o.cuda_event_tgt;
         cuda_event_dft   = o.cuda_event_dft;
         staging_slot_tgt = o.staging_slot_tgt;
@@ -2618,7 +2622,7 @@ common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoin
       pos_max(o.pos_max),
       data_tgt(o.data_tgt),
       data_dft(o.data_dft)
-#ifdef GGML_USE_CUDA
+#ifdef LLAMA_USE_CUDA_RUNTIME
       , copied_tgt(o.copied_tgt.load())
       , copied_dft(o.copied_dft.load())
       // cuda_event_*/staging_slot_*/async_active_* stay at defaults: copies only
@@ -2665,7 +2669,7 @@ void common_prompt_checkpoint::update_tgt(
 // NOTE: async checkpoint capture is disabled: post-merge it trips a backend assert /
 // deadlocks in the CUDA host-callback path with the MTP draft context. Falls back to
 // the synchronous path below (correct, just not overlapped with prefill).
-#if defined(GGML_USE_CUDA) && defined(LLAMA_CKPT_ASYNC_CAPTURE)
+#if defined(LLAMA_USE_CUDA_RUNTIME) && defined(LLAMA_CKPT_ASYNC_CAPTURE)
     // RTX-4090 / NVIDIA-dedicated: capture asynchronously into a pinned staging
     // buffer so the D2H transfer overlaps with subsequent prefill compute.
     int slot = g_ckpt_staging.acquire(ckpt_size);
@@ -2708,7 +2712,7 @@ void common_prompt_checkpoint::update_dft(
 
     data_dft.resize(ckpt_size);
 
-#if defined(GGML_USE_CUDA) && defined(LLAMA_CKPT_ASYNC_CAPTURE)
+#if defined(LLAMA_USE_CUDA_RUNTIME) && defined(LLAMA_CKPT_ASYNC_CAPTURE)
     int slot = g_ckpt_staging.acquire(ckpt_size);
     if (slot < 0) {
         cudaStreamSynchronize(cudaStreamPerThread);
@@ -2748,7 +2752,7 @@ bool common_prompt_checkpoint::load_tgt(
         return true;
     }
 
-#ifdef GGML_USE_CUDA
+#ifdef LLAMA_USE_CUDA_RUNTIME
     // ensure the async capture + host callback finished before reading data_tgt
     if (async_active_tgt && !copied_tgt.load(std::memory_order_acquire)) {
         cudaStreamSynchronize(cudaStreamPerThread);
@@ -2771,7 +2775,7 @@ bool common_prompt_checkpoint::load_dft(
         return true;
     }
 
-#ifdef GGML_USE_CUDA
+#ifdef LLAMA_USE_CUDA_RUNTIME
     if (async_active_dft && !copied_dft.load(std::memory_order_acquire)) {
         cudaStreamSynchronize(cudaStreamPerThread);
     }
