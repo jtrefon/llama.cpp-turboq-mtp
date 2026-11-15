@@ -1,9 +1,9 @@
 # COLLAB NOTES — Integrate RotorQuant (PlanarQuant + IsoQuant)
 
-**Branch:** `feature/rotorquant`  
-**GitHub Issue:** Indras-Mirror/llama.cpp-mtp#3  
-**Date:** 2026-05-10  
-**Status:** ✅ ALL TYPES WORKING — all 5 RotorQuant types pass at 4096 context (MTP, FA)  
+**Branch:** `feature/rotorquant`
+**GitHub Issue:** Indras-Mirror/llama.cpp-mtp#3
+**Date:** 2026-05-10
+**Status:** ✅ ALL TYPES WORKING — all 5 RotorQuant types pass at 4096 context (MTP, FA)
 **Date:** 2026-05-10 (Session 8+9)
 
 ## Test Results (4096 ctx, MTP+FA, Qwen3.6-27B, RTX 4090 sm_89)
@@ -50,7 +50,7 @@ Planar4/iso4→F32 re-used `tbq4_dequant_full_cuda` which only unpacks nibbles �
 1. **llama-graph.cpp crash**: Planar/iso types in k_is_tbq/v_is_tbq caused ggml_can_mul_mat assertion. Fixed by removing planar/iso from TBQ pass-through (VEC path handles dequant inline).
 2. **planar4_0/iso4_0 garbled output**: Missing dequant kernels with inverse rotation in cpy-planar-iso.cu. Fixed by adding kernel_dequant_planar4_f32 and kernel_dequant_iso4_f32.
 3. **supports_op missing entries**: Added PLANAR3_0/ISO3_0/PLANAR4_0/ISO4_0 to GET_ROWS, SET_ROWS, and CPY cases in ggml-cuda.cu.
-4. **-fit crash**: Memory estimation during auto-fit fails for new types. Workaround: use -fit off.  
+4. **-fit crash**: Memory estimation during auto-fit fails for new types. Workaround: use -fit off.
 
 ---
 
@@ -154,7 +154,7 @@ Drop-in KV cache compression that replaces the 128-element WHT butterfly (TurboQ
 
 ## VRAM Math (planar3 at 262K, Qwen3.6-27B)
 
-24 heads × 4 KV heads × 128 dim × 262K tokens = 
+24 heads × 4 KV heads × 128 dim × 262K tokens =
 - FP16: ~6.4 GB KV cache
 - planar3 (3-bit): ~2.1 GB KV cache
 - TBQ4_0 (4.25-bit): ~2.8 GB KV cache
@@ -171,7 +171,7 @@ So planar3 saves ~0.7 GB vs TBQ4_0 at 262K — enough for another ~40K context.
 
 1. **Port the kernel files**: Copy the 4 new files + 24 template instances from the rotorquant fork. Build and verify no compile errors.
 
-2. **Merge fattn.cu**: The hardest file. Need to combine our TBQ4 fused FA dispatch with rotorquant's planar/iso dispatch. Both add new switch cases in `ggml_cuda_flash_attn_ext_mma()`. 
+2. **Merge fattn.cu**: The hardest file. Need to combine our TBQ4 fused FA dispatch with rotorquant's planar/iso dispatch. Both add new switch cases in `ggml_cuda_flash_attn_ext_mma()`.
 
 3. **Add ggml types**: Define the 4 new `ggml_type` values and their properties (block size, type size, dequant function pointers).
 
