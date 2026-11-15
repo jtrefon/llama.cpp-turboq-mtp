@@ -323,7 +323,7 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
 
 # CPack packaging
 set(CPACK_PACKAGE_NAME "llama-turboq")
-set(CPACK_PACKAGE_VERSION "${LLAMA_INSTALL_VERSION}")
+set(CPACK_PACKAGE_VERSION "${LLAMA_VERSION_BASE}")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "llama.cpp fork with TurboQuant and MTP speculative decoding")
 set(CPACK_PACKAGE_VENDOR "jtrefon")
 set(CPACK_PACKAGE_CONTACT "jtrefon")
