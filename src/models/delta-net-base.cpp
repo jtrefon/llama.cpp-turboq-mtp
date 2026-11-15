@@ -394,6 +394,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * b,
         ggml_tensor * s,
         int           il) {
+    GGML_UNUSED(il);
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[1];
     const int64_t n_tokens = q->ne[2];

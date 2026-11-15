@@ -687,10 +687,13 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     // static_casts mctx to llama_kv_cache_iswa_context and dereferences a garbage
     // pointer (llama-graph.cpp:3120) for a dense MTP context, so it must not run
     // when swa_type == LLAMA_SWA_TYPE_NONE.
+    ggml_tensor * Qcur_mtp = Qcur;
+    ggml_tensor * Kcur_mtp = Kcur;
+    ggml_tensor * Vcur_mtp = Vcur;
     auto build_mtp_attn = [&](auto * inp) {
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+                Qcur_mtp, Kcur_mtp, Vcur_mtp, nullptr, nullptr, nullptr, kq_scale, il);
     };
     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
         build_mtp_attn(build_attn_inp_kv_iswa());
