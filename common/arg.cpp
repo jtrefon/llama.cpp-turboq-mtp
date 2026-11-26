@@ -4343,12 +4343,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             const auto types_str = string_split<std::string>(value, ',');
             auto types = common_speculative_types_from_names(types_str);
-            // "none" resets the type list rather than appending to it: this lets a
-            // preset (e.g. a non-MTP model) override a --spec-type set on the command line
-            if (std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NONE) != types.end()) {
-                params.speculative.types = std::vector<common_speculative_type>{ COMMON_SPECULATIVE_TYPE_NONE };
-            } else {
-                params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
+            // Each occurrence of this option is authoritative: config file, CLI args
+            // and per-model presets replace the list instead of appending to it.
+            // This lets a config manifest define one inference stack per model without
+            // the runtime carrying speculative settings over from the previous model.
+            // "none" clears the list.
+            params.speculative.types.clear();
+            for (auto type : types) {
+                if (type != COMMON_SPECULATIVE_TYPE_NONE) {
+                    params.speculative.types.push_back(type);
+                }
+            }
+            // a spec stack that does not use an external drafter must not inherit
+            // the previous model's draft model path from the config file
+            bool needs_external_drafter = false;
+            for (auto type : params.speculative.types) {
+                if (type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
+                    type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                    type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 ||
+                    type == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR ||
+                    type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) {
+                    needs_external_drafter = true;
+                    break;
+                }
+            }
+            if (!needs_external_drafter) {
+                params.speculative.draft.mparams.path.clear();
+                params.speculative.draft.mparams.hf_file.clear();
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
