@@ -67,7 +67,7 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, hparams.n_vocab_padded}, 0);
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     output_res_query = create_tensor(tn(LLM_TENSOR_OUTPUT_RES_QUERY, "weight"), {n_embd}, 0);
-    for (int i = 0; i < n_layer; ++i) {
+    for (int i = 0; i < n_layer_phys(); ++i) {
         auto & l = layers[i];
         const int64_t nh = hparams.n_head(i);
         const int64_t nk = hparams.n_head_kv(i);
@@ -217,6 +217,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
     }
     std::vector<ggml_tensor *> blocks;
     for (int il = 0; il < n_layer; ++il) {
+        // DSpark target features: the partial block at the layer input
+        res->t_layer_inp[il] = cur;
         const auto & l = model.layers[il];
         const bool swa = hparams.is_swa(il);
         const int64_t nh = hparams.n_head(il);
@@ -294,13 +296,18 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         cur = build_norm(cur, l.ffn_norm, nullptr, LLM_NORM_RMS, il);
         cur = build_moe_ffn(cur, l.ffn_gate_inp, nullptr, nullptr, l.ffn_down_exps, l.ffn_exp_probs_b,
                 hparams.n_expert, hparams.n_expert_used(il), LLM_FFN_SITU, true, hparams.expert_weights_scale,
-                LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, il, nullptr, l.ffn_gate_up_exps);
+                LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, il, nullptr, l.ffn_gate_up_exps,
+                l.ffn_up_exps_s, l.ffn_gate_exps_s, l.ffn_down_exps_s);
         cur = convolve(cur, l.ffn_post_conv, nullptr, state, history, recr, 2*kv + n_embd);
         cur = ggml_add(ctx0, residual, cur);
         cb(cur, "l_out", il);
     }
     cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+
+    // DSpark target features: the last one is the final norm output of every token
+    res->t_layer_inp[n_layer] = cur;
+
     if (out_ids) {
         cur = ggml_get_rows(ctx0, cur, out_ids);
     }
