@@ -5825,42 +5825,151 @@ static json get_res_models(const server_context_meta & meta) {
     };
 }
 
-// like get_res_models(), but also advertises the models in the preset registry
-// (available via POST /models/load) so clients can discover swap targets
+static int preset_option_int(const common_preset & preset, const char * env, int fallback) {
+    std::string value;
+    if (!preset.get_option(env, value) || value.empty()) {
+        return fallback;
+    }
+    try {
+        size_t pos = 0;
+        const int result = std::stoi(value, &pos);
+        while (pos < value.size() && std::isspace(static_cast<unsigned char>(value[pos]))) {
+            ++pos;
+        }
+        return pos == value.size() ? result : fallback;
+    } catch (const std::exception &) {
+        return fallback;
+    }
+}
+
+static std::string preset_option_str(const common_preset & preset, const char * env, const std::string & fallback) {
+    std::string value;
+    return preset.get_option(env, value) && !value.empty() ? value : fallback;
+}
+
+// like get_res_models(), but advertises every preset registry entry with the same
+// shape as the loaded model. Values come from the preset config when present and
+// fall back to the loaded model's metadata for fields the config does not set.
 static json get_res_models_ext(const server_context_meta & meta, const common_presets & presets) {
     json res = get_res_models(meta);
 
-    json data = res["data"]; // [ loaded model ]
-    data[0]["status"] = "loaded";
-    data[0]["loaded"] = true;
+    const json & caps = meta.chat_template_caps;
+    const bool caps_tools = caps.value("supports_tools", true);
+    const bool caps_reasoning = caps.value("supports_reasoning_effort", false)
+                             || caps.value("supports_preserve_reasoning", false);
+    const bool tools = caps_tools;
+    const bool loaded_image = meta.has_inp_image;
+    const bool loaded_video = meta.has_inp_video;
+    const bool loaded_audio = meta.has_inp_audio;
 
-    for (const auto & [name, preset] : presets) {
+    static const std::vector<std::string> kEffortLevels = {"none", "minimal", "low", "medium", "high", "xhigh", "max"};
+
+    auto make_entry = [&](const std::string & name, const common_preset * preset, bool is_loaded) {
         std::string model_path;
         std::string aliases;
-        std::string n_ctx_str;
-        preset.get_option("LLAMA_ARG_MODEL",    model_path);
-        preset.get_option("LLAMA_ARG_ALIAS",    aliases);
-        preset.get_option("LLAMA_ARG_CTX_SIZE", n_ctx_str);
+        int n_ctx = meta.slot_n_ctx;
+        int n_predict = 0;
+        bool reasoning = caps_reasoning;
+        bool reasoning_from_config = false;
+        bool image = loaded_image;
+        bool video = loaded_video;
+        bool audio = loaded_audio;
 
-        const bool is_loaded = meta.model_aliases.count(name) != 0
-                            || (!model_path.empty() && meta.model_path == model_path);
+        if (preset != nullptr) {
+            model_path = preset_option_str(*preset, "LLAMA_ARG_MODEL", "");
+            aliases    = preset_option_str(*preset, "LLAMA_ARG_ALIAS", "");
+            n_ctx      = preset_option_int(*preset, "LLAMA_ARG_CTX_SIZE", meta.slot_n_ctx);
+            n_predict  = preset_option_int(*preset, "LLAMA_ARG_N_PREDICT", 0);
+            const std::string reasoning_cfg = preset_option_str(*preset, "LLAMA_ARG_REASONING", "");
+            if (!reasoning_cfg.empty()) {
+                reasoning = reasoning_cfg == "on" || reasoning_cfg == "true" || reasoning_cfg == "1";
+                reasoning_from_config = true;
+            }
+            if (!preset_option_str(*preset, "LLAMA_ARG_MMPROJ", "").empty()) {
+                image = true;
+            }
+        }
 
-        data.push_back({
-            {"id",       name},
-            {"model",    name},
-            {"aliases",  aliases},
-            {"object",   "model"},
-            {"owned_by", "llamacpp"},
-            {"created",  std::time(0)},
-            {"status",   is_loaded ? "loaded" : "unloaded"},
-            {"loaded",   is_loaded},
-            // configured context window; the slot window may be capped on load
-            {"context_length", n_ctx_str.empty() ? 0 : std::stoi(n_ctx_str)},
+        std::vector<std::string> input_modalities = {"text"};
+        if (image) input_modalities.push_back("image");
+        if (video) input_modalities.push_back("video");
+        if (audio) input_modalities.push_back("audio");
+
+        std::vector<std::string> supported_parameters;
+        if (tools) supported_parameters.push_back("tools");
+        if (reasoning) supported_parameters.push_back("reasoning_effort");
+
+        json effort = nullptr;
+        if (reasoning) {
+            std::vector<std::string> levels = kEffortLevels;
+            // A preset that declares reasoning uses the server's ladder; only a
+            // preset without config falls back to the loaded template's probe.
+            if (!reasoning_from_config && caps.contains("reasoning_effort_levels") && caps["reasoning_effort_levels"].is_array()) {
+                levels = caps["reasoning_effort_levels"].get<std::vector<std::string>>();
+                if (std::find(levels.begin(), levels.end(), "max") == levels.end()) {
+                    levels.push_back("max");
+                }
+            }
+            effort = {
+                {"supported_levels", levels},
+                {"default_level",    "medium"},
+            };
+        }
+
+        json entry = {
+            {"id",        name},
+            {"model",     name},
+            {"aliases",   aliases},
+            {"object",    "model"},
+            {"owned_by",  "llamacpp"},
+            {"created",   std::time(0)},
+            {"status",    is_loaded ? "loaded" : "unloaded"},
+            {"loaded",    is_loaded},
+            {"architecture", {
+                {"input_modalities",  input_modalities},
+                {"output_modalities", meta.model_output_modalities},
+            }},
+            // config when provided, loaded model metadata as fallback
+            {"context_length", n_ctx},
+            {"max_completion_tokens", n_predict},
+            {"meta", {
+                {"n_ctx",       n_ctx},
+                {"n_ctx_train", meta.model_n_ctx_train},
+                {"n_vocab",     meta.model_vocab_n_tokens},
+                {"n_params",    meta.model_n_params},
+                {"size",        meta.model_size},
+                {"ftype",       meta.model_ftype},
+            }},
+            {"supported_parameters", supported_parameters},
+            {"effort", effort},
             {"details", {
                 {"format",     "gguf"},
-                {"model_path", model_path},
+                {"model_path", model_path.empty() ? meta.model_path : model_path},
             }},
-        });
+        };
+        return entry;
+    };
+
+    json data = json::array();
+    if (presets.empty()) {
+        data.push_back(make_entry(meta.model_name, nullptr, true));
+    } else {
+        // The loaded model can report a preset key or a raw path. Resolve one
+        // authoritative key so exactly one registry entry is marked loaded.
+        std::string loaded_key;
+        if (presets.count(meta.model_name) != 0) {
+            loaded_key = meta.model_name;
+        } else {
+            for (const auto & [name, preset] : presets) {
+                if (preset_option_str(preset, "LLAMA_ARG_MODEL", "") == meta.model_path) {
+                    loaded_key = name;
+                    break;
+                }
+            }
+        }
+        for (const auto & [name, preset] : presets) {
+            data.push_back(make_entry(name, &preset, name == loaded_key));
+        }
     }
 
     res["data"] = data;
