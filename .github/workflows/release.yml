@@ -75,7 +75,8 @@ jobs:
             -DGGML_NATIVE=OFF \
             -DBUILD_SHARED_LIBS=OFF \
             -DLLAMA_BUILD_SERVER=ON \
-            -DLLAMA_BUILD_TESTS=OFF
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_USE_PREBUILT_UI=OFF
 
       - name: Build
         run: cmake --build build --config Release -j $(nproc)
@@ -114,7 +115,8 @@ jobs:
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DGGML_NATIVE=OFF \
             -DLLAMA_BUILD_SERVER=ON \
-            -DLLAMA_BUILD_TESTS=OFF
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_USE_PREBUILT_UI=OFF
 
       - name: Build
         run: cmake --build build --config Release -j $(nproc)
@@ -170,7 +172,6 @@ jobs:
             - `llama-server` — HTTP server with OpenAI-compatible API
             - `llama-cli` — CLI inference tool
             - `llama-bench` — Benchmark utility
-            - Shared libraries (`libllama.so`, `libggml*.so`)
 
             **Downloads:**
             - [Source](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ needs.source.outputs.tag }}/llama-turboq-${{ needs.source.outputs.tag }}-source.tar.gz)
